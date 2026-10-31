@@ -284,6 +284,10 @@ class OctopusChargeApiClient:
         self._is_api_key_invalid = False
         self._token_retrieval_failures = 0
         self._token_retrieval_cooldown_until: datetime | None = None
+        # Whether any request has been accepted with the current token yet, and
+        # the last token whose refusal was counted towards the cooldown.
+        self._token_confirmed = False
+        self._failure_counted_for: str | None = None
 
     # ------------------------------------------------------------------
     # Authentication
@@ -297,6 +301,7 @@ class OctopusChargeApiClient:
 
     def _reset_tokens(self) -> None:
         self._token = None
+        self._token_confirmed = False
         self._token_expiry = None
         self._refresh_token = None
         self._refresh_token_expiry = None
@@ -390,24 +395,40 @@ class OctopusChargeApiClient:
             self._token_retrieval_cooldown_until,
         )
 
-    def _token_rejected(self, token: str, *, fresh: bool) -> None:
+    def _is_untested(self, token: str, *, retrieved: bool) -> bool:
+        """Return whether no request has been accepted with this token yet.
+
+        Tracked on the shared token, not just by the call that retrieved it, so
+        concurrent requests reusing a brand new token treat it as untested too.
+        """
+        return retrieved or (token == self._token and not self._token_confirmed)
+
+    def _token_rejected(self, token: str, *, untested: bool) -> None:
         """Handle Octopus refusing a request's token.
 
-        A token that had been in use is thrown away so the next attempt retrieves
-        a new one with the API key - but only if it is still the current one, so
-        a late rejection can't discard a token another request just retrieved. A
-        token retrieved for this very request being refused too is something
-        retrieving yet another one won't fix, so it counts towards the cooldown
-        instead of spending the rate limited token endpoint on every request.
+        The token is thrown away so a later attempt retrieves a new one with the
+        API key - but only if it is still the current one, so a late rejection
+        can't discard a token another request just retrieved. A token that has
+        never been accepted being refused is something retrieving yet another one
+        straight away won't fix, so it also counts (once, however many requests
+        it was refused for) towards the cooldown, which then paces the next
+        retrieval instead of every request spending the rate limited endpoint.
         """
-        if fresh:
+        if untested and self._failure_counted_for != token:
+            self._failure_counted_for = token
             self._record_token_retrieval_failure()
-        elif self._token == token:
+        if self._token == token:
             self._reset_tokens()
 
-    def _token_accepted(self) -> None:
-        """Note that a request was accepted, ending any run of token failures."""
-        self._token_retrieval_failures = 0
+    def _token_accepted(self, token: str) -> None:
+        """Note that a request was accepted, ending any run of token failures.
+
+        Only for the current token: a late success with a token that has since
+        been replaced says nothing about the replacement.
+        """
+        if token == self._token:
+            self._token_confirmed = True
+            self._token_retrieval_failures = 0
 
     async def _async_fetch_token(self) -> None:
         if self._refresh_token is None:
@@ -437,6 +458,8 @@ class OctopusChargeApiClient:
             )
 
         self._token = access_token
+        self._token_confirmed = False
+        self._failure_counted_for = None
         self._refresh_token = refresh_token
         self._refresh_token_expiry = refresh_expiry
         self._token_expiry = _decode_jwt_expiry(access_token)
@@ -543,16 +566,17 @@ class OctopusChargeApiClient:
         - with an HTTP 401/403, re-entering the key won't fix it, so it is a
           request error (and counts towards the token retrieval cooldown).
         """
-        token, fresh = await self._async_ensure_token()
+        token, retrieved = await self._async_ensure_token()
         while True:
             try:
                 body = await self._async_post(url, {"query": query}, context, token)
                 break
             except OctopusChargeAuthError as err:
-                if not fresh:
-                    self._token_rejected(token, fresh=False)
+                untested = self._is_untested(token, retrieved=retrieved)
+                if not untested:
+                    self._token_rejected(token, untested=False)
                 elif isinstance(err, OctopusChargeUnauthenticatedError):
-                    self._token_rejected(token, fresh=True)
+                    self._token_rejected(token, untested=True)
                     raise OctopusChargeRequestError(
                         f"Request rejected with a newly retrieved token ({context})"
                     ) from err
@@ -560,10 +584,10 @@ class OctopusChargeApiClient:
                     raise
 
             _LOGGER.debug("Token rejected (%s) - retrying with a new one", context)
-            token, _ = await self._async_ensure_token()
-            fresh = True
+            token, retrieved = await self._async_ensure_token()
+            retrieved = True
 
-        self._token_accepted()
+        self._token_accepted(token)
         return body.get("data") or {}
 
     # ------------------------------------------------------------------
@@ -798,7 +822,7 @@ class OctopusChargeApiClient:
                             "Live power stream refused the token"
                         ) from err
 
-                self._token_accepted()
+                self._token_accepted(token)
                 buffer = ""
                 async for chunk in response.content.iter_any():
                     buffer, readings = parse_power_stream_chunk(buffer, chunk)

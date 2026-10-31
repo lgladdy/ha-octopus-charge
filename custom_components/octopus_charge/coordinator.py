@@ -71,7 +71,7 @@ class OctopusChargeCoordinator(DataUpdateCoordinator[dict[str, OnboardedChargePo
         )
         self.client = client
         self.account_number: str = entry.data[CONF_ACCOUNT_NUMBER]
-        # When the data was last successfully retrieved from Octopus.
+        # When the latest successful poll started (its data is as of then).
         self.last_retrieved: datetime | None = None
 
         self._property_ids: list[str] | None = None
@@ -81,6 +81,10 @@ class OctopusChargeCoordinator(DataUpdateCoordinator[dict[str, OnboardedChargePo
 
     async def _async_update_data(self) -> dict[str, OnboardedChargePoint]:
         """Fetch the account's charge points."""
+        # Stamped with when the request started, not finished: the data is "as
+        # of" then, so a poll already in flight when a command was sent can't
+        # count as having seen it (see OptimisticValue).
+        started = dt_util.utcnow()
         try:
             if self._property_ids is None:
                 property_ids = await self.client.async_get_property_ids(
@@ -110,7 +114,7 @@ class OctopusChargeCoordinator(DataUpdateCoordinator[dict[str, OnboardedChargePo
             ) from err
 
         self._consecutive_failures = 0
-        self.last_retrieved = dt_util.utcnow()
+        self.last_retrieved = started
         return charge_points
 
     @callback

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from datetime import timedelta
@@ -482,6 +483,38 @@ async def test_auth_error_code_for_a_token_in_use_is_retried(
 
     assert await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID) == []
     assert len(calls_to(token_mock, KRAKEN_GRAPHQL_URL)) == 2
+
+
+async def test_concurrent_refusals_of_a_new_token_count_once(
+    client: OctopusChargeApiClient, token_mock: AiohttpClientMocker
+) -> None:
+    """Requests sharing a never-accepted token don't each fetch a replacement."""
+    token_mock.post(BACKEND_GRAPHQL_URL, status=401, text="nope")
+
+    results = await asyncio.gather(
+        *(
+            client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
+            for _ in range(3)
+        ),
+        return_exceptions=True,
+    )
+
+    assert all(isinstance(result, OctopusChargeError) for result in results)
+    assert len(calls_to(token_mock, KRAKEN_GRAPHQL_URL)) == 1
+    assert client._token_retrieval_failures == 1
+
+
+async def test_a_late_success_with_a_replaced_token_keeps_the_backoff(
+    client: OctopusChargeApiClient, token_mock: AiohttpClientMocker
+) -> None:
+    await client._async_ensure_token()
+    old_token = client._token
+    client._token = "replacement"
+    client._token_retrieval_failures = 2
+
+    client._token_accepted(old_token)  # type: ignore[arg-type]
+
+    assert client._token_retrieval_failures == 2
 
 
 async def test_404_is_a_request_error(

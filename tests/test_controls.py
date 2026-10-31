@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
@@ -196,6 +197,45 @@ async def test_data_from_before_a_command_never_confirms_it(
     await _switch(hass, SERVICE_TURN_ON, ECO_MODE)
 
     # A poll that has only caught up with the first command still shows "on".
+    freezer.tick(timedelta(seconds=1))
+    config = {**charge_point_data()["configuration"], "isEcoModeEnabled": False}
+    await update_charge_point(
+        hass, setup_integration, mock_client, configuration=config
+    )
+    assert hass.states.get(ECO_MODE).state == STATE_ON
+
+
+async def test_a_poll_started_before_a_command_never_confirms_it(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_client: AsyncMock,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Off then on, with a poll in flight that still shows "on" from before."""
+    coordinator = setup_integration.runtime_data.coordinator
+    release = asyncio.Event()
+    stale = mock_client.async_get_charge_points.return_value
+
+    async def _slow_poll(*_: object) -> list[OnboardedChargePoint]:
+        await release.wait()
+        return stale
+
+    mock_client.async_get_charge_points.side_effect = _slow_poll
+    # Not a tracked hass task: async_block_till_done would wait for it.
+    poll = asyncio.create_task(coordinator.async_refresh())
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    freezer.tick(timedelta(seconds=1))
+    await _switch(hass, SERVICE_TURN_OFF, ECO_MODE)
+    freezer.tick(timedelta(seconds=1))
+    await _switch(hass, SERVICE_TURN_ON, ECO_MODE)
+    freezer.tick(timedelta(seconds=1))
+    release.set()
+    await poll
+    mock_client.async_get_charge_points.side_effect = None
+
+    # The next poll has only caught up with "off": the pending "on" still holds.
     freezer.tick(timedelta(seconds=1))
     config = {**charge_point_data()["configuration"], "isEcoModeEnabled": False}
     await update_charge_point(
