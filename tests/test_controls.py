@@ -184,6 +184,26 @@ async def test_a_command_is_trusted_until_octopus_reflects_it(
     assert hass.states.get(ECO_MODE).state == STATE_ON
 
 
+async def test_data_from_before_a_command_never_confirms_it(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_client: AsyncMock,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Off then on: the cached pre-command "on" doesn't confirm the second one."""
+    await _switch(hass, SERVICE_TURN_OFF, ECO_MODE)
+    freezer.tick(timedelta(seconds=1))
+    await _switch(hass, SERVICE_TURN_ON, ECO_MODE)
+
+    # A poll that has only caught up with the first command still shows "on".
+    freezer.tick(timedelta(seconds=1))
+    config = {**charge_point_data()["configuration"], "isEcoModeEnabled": False}
+    await update_charge_point(
+        hass, setup_integration, mock_client, configuration=config
+    )
+    assert hass.states.get(ECO_MODE).state == STATE_ON
+
+
 async def test_a_command_that_never_sticks_gives_way(
     hass: HomeAssistant,
     setup_integration: MockConfigEntry,

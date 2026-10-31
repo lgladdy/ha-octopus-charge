@@ -45,7 +45,7 @@ class OctopusChargeControlModeSelect(OctopusChargeEntity, SelectEntity):
         """Return the current control mode."""
         charge_point = self.charge_point
         fetched = charge_point.controlMode if charge_point is not None else None
-        return self._optimistic.resolve(fetched)
+        return self._optimistic.resolve(fetched, self.coordinator.last_retrieved)
 
     async def async_select_option(self, option: str) -> None:
         """Set the control mode."""

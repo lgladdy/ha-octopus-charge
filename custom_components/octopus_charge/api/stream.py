@@ -68,9 +68,15 @@ def parse_power_stream_chunk(
         payload = (
             payload_data.get("payload") if isinstance(payload_data, dict) else None
         )
-        if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
-            # An error part (transport- or payload-level) carries no reading - it
-            # isn't "no power", so don't report it as 0kW.
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("data"), dict)
+            or payload_data.get("errors")
+            or payload.get("errors")
+        ):
+            # An error part (transport-, payload- or field-level, the last with a
+            # null reading alongside it) carries no reading - it isn't "no
+            # power", so don't report it as 0kW.
             _LOGGER.debug("Ignoring live power stream part without data: %s", body_text)
             continue
 

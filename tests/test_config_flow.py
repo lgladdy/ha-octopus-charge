@@ -288,3 +288,27 @@ async def test_existing_account_set_up_meanwhile_aborts(
     result = await _submit(hass, second["flow_id"], account_number=ACCOUNT_NUMBER)
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "already_configured"
+
+
+async def test_only_existing_account_set_up_meanwhile_aborts(
+    hass: HomeAssistant, mock_client: AsyncMock
+) -> None:
+    """Also when it was the only account offered (nothing left to offer)."""
+    _octopus_energy_entry(hass)
+
+    first = await _start(hass)
+    first = await hass.config_entries.flow.async_configure(
+        first["flow_id"], {"next_step_id": "existing"}
+    )
+    second = await _start(hass)
+    second = await hass.config_entries.flow.async_configure(
+        second["flow_id"], {"next_step_id": "existing"}
+    )
+
+    result = await _submit(hass, first["flow_id"], account_number=ACCOUNT_NUMBER)
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done()
+
+    result = await _submit(hass, second["flow_id"], account_number=ACCOUNT_NUMBER)
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"

@@ -16,6 +16,7 @@ from pydantic import ValidationError
 
 from .exceptions import (
     OctopusChargeAuthError,
+    OctopusChargeCannotConnectError,
     OctopusChargeConnectionError,
     OctopusChargeError,
     OctopusChargeRequestError,
@@ -337,9 +338,11 @@ class OctopusChargeApiClient:
             except OctopusChargeAuthError:
                 self._is_api_key_invalid = True
                 raise
-            except OctopusChargeConnectionError:
-                # Never reached Octopus, so it doesn't count towards its rate
-                # limit; the callers' own retry backoff paces the next attempt.
+            except OctopusChargeCannotConnectError:
+                # Never sent, so it can't count towards Octopus's rate limit; the
+                # callers' own retry backoff paces the next attempt. (A timeout
+                # may come after Octopus received the request, so it still gets
+                # the cooldown below.)
                 raise
             except OctopusChargeError:
                 # Any other failure (server error, rate limit reported as a
@@ -459,6 +462,11 @@ class OctopusChargeApiClient:
             ) as response:
                 text = await response.text()
                 status = response.status
+        except aiohttp.ClientConnectorError as err:
+            _LOGGER.warning("Failed to connect (%s): %s", context, type(err).__name__)
+            raise OctopusChargeCannotConnectError(
+                f"Failed to connect ({context})"
+            ) from err
         except (TimeoutError, aiohttp.ClientError) as err:
             _LOGGER.warning("Failed to connect (%s): %s", context, type(err).__name__)
             raise OctopusChargeConnectionError(

@@ -15,6 +15,10 @@ class OctopusChargeConnectionError(OctopusChargeError):
     """Could not reach Octopus (timeout or network failure)."""
 
 
+class OctopusChargeCannotConnectError(OctopusChargeConnectionError):
+    """No connection could be made, so the request was never sent."""
+
+
 class OctopusChargeRequestError(OctopusChargeError):
     """Octopus rejected the request."""
 

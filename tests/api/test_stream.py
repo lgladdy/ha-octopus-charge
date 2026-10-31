@@ -135,3 +135,15 @@ def test_error_parts_are_not_zero_readings() -> None:
     _, readings = parse_power_stream_chunk("", message)
 
     assert readings == []
+
+
+def test_field_errors_with_a_null_reading_are_not_zero_readings() -> None:
+    message = (
+        b"--graphql\r\ncontent-type: application/json\r\n\r\n"
+        b'{"payload":{"data":{"electricChargerPowerReadings":null},'
+        b'"errors":[{"message":"boom"}]}}\r\n--graphql'
+    )
+
+    _, readings = parse_power_stream_chunk("", message)
+
+    assert readings == []

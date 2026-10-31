@@ -56,7 +56,7 @@ class OctopusChargeLedBrightnessNumber(OctopusChargeEntity, NumberEntity):
             if charge_point is not None and charge_point.configuration is not None
             else None
         )
-        return self._optimistic.resolve(fetched)
+        return self._optimistic.resolve(fetched, self.coordinator.last_retrieved)
 
     async def async_set_native_value(self, value: float) -> None:
         """Set the LED brightness percentage."""

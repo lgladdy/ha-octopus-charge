@@ -6,6 +6,7 @@ import base64
 import json
 from datetime import timedelta
 from typing import Any
+from unittest.mock import MagicMock
 
 import aiohttp
 import pytest
@@ -270,8 +271,11 @@ async def test_other_token_failures_trigger_a_cooldown(
 async def test_connection_failures_do_not_trigger_a_cooldown(
     client: OctopusChargeApiClient, aioclient_mock: AiohttpClientMocker
 ) -> None:
-    """A request that never reached Octopus doesn't count towards its rate limit."""
-    aioclient_mock.post(KRAKEN_GRAPHQL_URL, exc=aiohttp.ClientError())
+    """A request that was never sent doesn't count towards the rate limit."""
+    aioclient_mock.post(
+        KRAKEN_GRAPHQL_URL,
+        exc=aiohttp.ClientConnectorError(MagicMock(), OSError("refused")),
+    )
     with pytest.raises(OctopusChargeConnectionError):
         await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
 
@@ -280,6 +284,19 @@ async def test_connection_failures_do_not_trigger_a_cooldown(
     aioclient_mock.post(BACKEND_GRAPHQL_URL, json={"data": {}})
 
     assert await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID) == []
+
+
+async def test_timeouts_still_trigger_a_cooldown(
+    client: OctopusChargeApiClient, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """Octopus may have received (and counted) a request that timed out."""
+    aioclient_mock.post(KRAKEN_GRAPHQL_URL, exc=TimeoutError())
+    with pytest.raises(OctopusChargeConnectionError):
+        await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
+
+    with pytest.raises(OctopusChargeServerError):
+        await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
+    assert aioclient_mock.call_count == 1
 
 
 async def test_refused_refresh_token_falls_back_to_the_api_key(

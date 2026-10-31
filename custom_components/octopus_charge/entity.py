@@ -58,27 +58,38 @@ class OptimisticValue[T]:
     After a command, Octopus can take a while to reflect the change, so polls -
     including one already in flight when the command was sent - can read the old
     value back and make the entity flip-flop. The sent value is shown until a
-    poll returns it, or until OPTIMISTIC_TIMEOUT passes without one doing so (the
-    command evidently didn't stick), after which the fetched value wins again.
+    poll completed after the command returns it, or until OPTIMISTIC_TIMEOUT
+    passes without one doing so (the command evidently didn't stick), after which
+    the fetched value wins again. Data from before the command never confirms it:
+    after "off" then "on" in quick succession, the cached pre-command "on" would
+    otherwise end the wait for the second command early.
     """
 
     def __init__(self) -> None:
         """Initialise with nothing pending."""
         self._value: T | None = None
+        self._set_at: datetime | None = None
         self._expires: datetime | None = None
 
     def set(self, value: T) -> None:
         """Record a value that has just been sent to the charger."""
         self._value = value
-        self._expires = dt_util.utcnow() + OPTIMISTIC_TIMEOUT
+        self._set_at = dt_util.utcnow()
+        self._expires = self._set_at + OPTIMISTIC_TIMEOUT
 
-    def resolve(self, fetched: T | None) -> T | None:
-        """Return the value the entity should currently show."""
-        if self._expires is not None:
-            if fetched != self._value and dt_util.utcnow() < self._expires:
+    def resolve(self, fetched: T | None, retrieved_at: datetime | None) -> T | None:
+        """Return the value to show, given the fetched value and when it arrived."""
+        if self._expires is not None and self._set_at is not None:
+            confirmed = (
+                fetched == self._value
+                and retrieved_at is not None
+                and retrieved_at > self._set_at
+            )
+            if not confirmed and dt_util.utcnow() < self._expires:
                 return self._value
 
             self._expires = None
+            self._set_at = None
             self._value = None
 
         return fetched

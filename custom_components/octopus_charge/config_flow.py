@@ -161,7 +161,7 @@ class OctopusChargeConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Reuse the API key from an Octopus Energy integration account."""
         accounts = self._existing_accounts()
-        if not accounts:
+        if not accounts and user_input is None:
             return await self.async_step_manual()
 
         errors: dict[str, str] = {}

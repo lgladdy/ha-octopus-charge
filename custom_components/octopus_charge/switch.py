@@ -150,7 +150,7 @@ class OctopusChargeSettingSwitch(OctopusChargeEntity, SwitchEntity):
         fetched = (
             self.entity_description.value_fn(charge_point) if charge_point else None
         )
-        return self._optimistic.resolve(fetched)
+        return self._optimistic.resolve(fetched, self.coordinator.last_retrieved)
 
     async def _async_set(self, enabled: bool) -> None:
         await self._async_send(
@@ -192,7 +192,7 @@ class OctopusChargeBoostSwitch(OctopusChargeEntity, SwitchEntity):
             if charge_point is not None and charge_point.operationalState is not None
             else None
         )
-        return self._optimistic.resolve(fetched)
+        return self._optimistic.resolve(fetched, self.coordinator.last_retrieved)
 
     async def _async_start(self, duration: timedelta) -> None:
         await self._async_send(
