@@ -29,6 +29,10 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
 )
 STEP_REAUTH_DATA_SCHEMA = vol.Schema({vol.Required(CONF_API_KEY): str})
 
+API_KEY_URL = (
+    "https://octopus.energy/dashboard/new/accounts/personal-details/api-access"
+)
+
 
 class OctopusChargeConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Octopus Charge."""
@@ -93,6 +97,7 @@ class OctopusChargeConfigFlow(ConfigFlow, domain=DOMAIN):
             data_schema=self.add_suggested_values_to_schema(
                 STEP_USER_DATA_SCHEMA, user_input
             ),
+            description_placeholders={"api_key_url": API_KEY_URL},
             errors=errors,
         )
 

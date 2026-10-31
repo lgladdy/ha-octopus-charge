@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Connect to Octopus Energy",
-        "description": "Enter your Octopus Energy API key and account number. You can find both in your [Octopus Energy account](https://octopus.energy/dashboard/new/accounts/personal-details/api-access).",
+        "description": "Enter your Octopus Energy API key and account number. You can find both in your [Octopus Energy account]({api_key_url}).",
         "data": {
           "api_key": "API key",
           "account_number": "Account number"
