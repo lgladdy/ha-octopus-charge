@@ -247,13 +247,23 @@ class OctopusChargeScheduleCoordinator(DataUpdateCoordinator[dict[str, ScheduleB
 
     @callback
     def _async_arm_transition_timer(
-        self, device_uuid: str, schedule: ScheduleByDay
+        self,
+        device_uuid: str,
+        schedule: ScheduleByDay,
+        after: datetime | None = None,
     ) -> None:
-        """(Re)arm the timer for a charge point's next scheduled start/end."""
+        """(Re)arm the timer for a charge point's next scheduled start/end.
+
+        ``after`` is the boundary that has just been served: the timer fires a
+        little *before* its boundary, so working from "now" would pick the same
+        boundary again and trigger it twice.
+        """
         if (cancel := self._cancel_timers.pop(device_uuid, None)) is not None:
             cancel()
 
-        next_transition = compute_next_schedule_transition(schedule, dt_util.now())
+        next_transition = compute_next_schedule_transition(
+            schedule, after or dt_util.now()
+        )
         if next_transition is None:
             return
 
@@ -265,9 +275,11 @@ class OctopusChargeScheduleCoordinator(DataUpdateCoordinator[dict[str, ScheduleB
         @callback
         def _on_transition(_now: datetime) -> None:
             self._status_coordinator.async_start_burst_refresh()
-            # The schedule itself hasn't changed, so the next boundary can be
-            # armed straight away rather than waiting for the next poll.
-            self._async_arm_transition_timer(device_uuid, schedule)
+            # The schedule itself hasn't changed, so the boundary after this one
+            # can be armed straight away rather than waiting for the next poll.
+            self._async_arm_transition_timer(
+                device_uuid, schedule, after=next_transition
+            )
 
         self._cancel_timers[device_uuid] = async_track_point_in_time(
             self.hass, _on_transition, fire_at

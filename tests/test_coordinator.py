@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Generator
-from datetime import timedelta
+from collections.abc import Callable, Generator
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -12,6 +12,7 @@ import pytest
 from freezegun.api import FrozenDateTimeFactory
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
     async_fire_time_changed,
@@ -301,28 +302,47 @@ async def test_setup_survives_a_schedule_failure(
     assert mock_config_entry.state is ConfigEntryState.LOADED
 
 
-async def test_scheduled_transition_triggers_a_burst(
+async def test_scheduled_transitions_trigger_a_burst_and_rearm_for_the_next_one(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
     mock_client: AsyncMock,
     freezer: FrozenDateTimeFactory,
 ) -> None:
-    # Monday 17:00 Pacific, an hour before the 18:00 period starts.
+    # Monday 17:00 Pacific, an hour before the 18:00-19:00 period.
     freezer.move_to("2026-09-01 00:00:00+00:00")
+    timers: list[tuple[Callable[[datetime], None], datetime]] = []
+
+    def _capture(
+        _hass: HomeAssistant, action: Callable[[datetime], None], when: datetime
+    ) -> Callable[[], None]:
+        timers.append((action, when))
+        return lambda: None
+
     mock_config_entry.add_to_hass(hass)
-    with patch("custom_components.octopus_charge.coordinator.random.uniform") as jitter:
-        jitter.return_value = 0
+    with (
+        patch(
+            "custom_components.octopus_charge.coordinator.async_track_point_in_time",
+            _capture,
+        ),
+        patch("custom_components.octopus_charge.coordinator.random") as rnd,
+        patch.object(OctopusChargeCoordinator, "async_start_burst_refresh") as burst,
+    ):
+        rnd.uniform.return_value = 0
         await hass.config_entries.async_setup(mock_config_entry.entry_id)
         await hass.async_block_till_done()
-        coordinator = mock_config_entry.runtime_data.coordinator
-        assert coordinator._burst_task is None
 
-        # The burst starts a few seconds *before* the boundary.
-        freezer.move_to("2026-09-01 00:59:56+00:00")
-        async_fire_time_changed(hass)
-        await hass.async_block_till_done()
+        # The burst is armed a few seconds *before* the 18:00 start (01:00 UTC).
+        assert [when for _, when in timers] == [
+            datetime(2026, 9, 1, 0, 59, 55, tzinfo=UTC)
+        ]
+        burst.assert_not_called()
 
-    assert coordinator._burst_task is not None
+        # When it fires, a burst starts and the timer moves on to the 19:00 end -
+        # not back to the 18:00 boundary it has just served.
+        freezer.move_to("2026-09-01 00:59:55+00:00")
+        timers[0][0](dt_util.utcnow())
+        burst.assert_called_once()
+        assert timers[1][1] == datetime(2026, 9, 1, 1, 59, 55, tzinfo=UTC)
 
 
 async def test_unloading_cancels_the_transition_timers(
