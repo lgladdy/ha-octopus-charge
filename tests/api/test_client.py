@@ -765,6 +765,27 @@ async def test_stream_refusal_leaves_the_shared_token_alone(
     assert len(calls_to(token_mock, KRAKEN_GRAPHQL_URL)) == 1
 
 
+async def test_stream_of_only_errors_does_not_confirm_the_token(
+    client: OctopusChargeApiClient, token_mock: AiohttpClientMocker
+) -> None:
+    """A 200 carrying nothing but error parts says nothing good about the token."""
+    await client._async_ensure_token()
+    client._token_retrieval_failures = 2
+    token_mock.post(
+        BACKEND_GRAPHQL_URL,
+        text=(
+            "--graphql\r\ncontent-type: application/json\r\n\r\n"
+            '{"payload":null,"errors":[{"message":"JWT has expired"}]}\r\n'
+            "--graphql--"
+        ),
+    )
+
+    readings = [r async for r in client.async_stream_power(ACCOUNT_NUMBER, DEVICE_UUID)]
+
+    assert readings == []
+    assert client._token_retrieval_failures == 2
+
+
 async def test_stream_cloudfront_403_keeps_the_token(
     client: OctopusChargeApiClient, token_mock: AiohttpClientMocker
 ) -> None:

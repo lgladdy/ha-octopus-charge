@@ -822,11 +822,17 @@ class OctopusChargeApiClient:
                             "Live power stream refused the token"
                         ) from err
 
-                self._token_accepted(token)
+                # A 200 can still carry nothing but (auth) error parts, so the
+                # token only counts as accepted once a reading arrives - error
+                # parts are skipped by the parser.
+                accepted = False
                 buffer = ""
                 async for chunk in response.content.iter_any():
                     buffer, readings = parse_power_stream_chunk(buffer, chunk)
                     for reading in readings:
+                        if not accepted:
+                            self._token_accepted(token)
+                            accepted = True
                         yield reading
         except (TimeoutError, aiohttp.ClientError) as err:
             raise OctopusChargeConnectionError(
