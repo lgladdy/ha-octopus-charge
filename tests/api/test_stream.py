@@ -1,0 +1,107 @@
+"""Tests for the live power stream parser."""
+
+from __future__ import annotations
+
+from custom_components.octopus_charge.api.models import ChargePointPowerReading
+from custom_components.octopus_charge.api.stream import parse_power_stream_chunk
+
+
+def make_part(body: str) -> str:
+    return f"Content-Type: application/json\n\n{body}\n"
+
+
+def reading_body(value: float) -> str:
+    return (
+        '{"payload":{"data":{"electricChargerPowerReadings":'
+        f'{{"value":{value},"unit":"KILOWATT"}}}}}}}}'
+    )
+
+
+def kw(value: float) -> ChargePointPowerReading:
+    return ChargePointPowerReading(value=value, unit="KILOWATT")
+
+
+def test_single_complete_reading() -> None:
+    chunk = f"--graphql\n{make_part(reading_body(3.2))}--graphql\n".encode()
+
+    _, readings = parse_power_stream_chunk("", chunk)
+
+    assert readings == [kw(3.2)]
+
+
+def test_heartbeat_yields_nothing() -> None:
+    chunk = f"--graphql\n{make_part('{}')}--graphql\n".encode()
+
+    _, readings = parse_power_stream_chunk("", chunk)
+
+    assert readings == []
+
+
+def test_null_reading_yields_none() -> None:
+    body = '{"payload":{"data":{"electricChargerPowerReadings":null}}}'
+    chunk = f"--graphql\n{make_part(body)}--graphql\n".encode()
+
+    _, readings = parse_power_stream_chunk("", chunk)
+
+    assert readings == [None]
+
+
+def test_malformed_reading_yields_none_without_crashing() -> None:
+    body = '{"payload":{"data":{"electricChargerPowerReadings":{"unit":"KILOWATT"}}}}'
+    chunk = f"--graphql\n{make_part(body)}--graphql\n".encode()
+
+    _, readings = parse_power_stream_chunk("", chunk)
+
+    assert readings == [None]
+
+
+def test_reading_split_across_chunks_parses_once_boundary_arrives() -> None:
+    full_part = f"--graphql\n{make_part(reading_body(1.5))}"
+    split = len(full_part) // 2
+
+    buffer, first = parse_power_stream_chunk("", full_part[:split].encode())
+    _, second = parse_power_stream_chunk(
+        buffer, (full_part[split:] + "--graphql\n").encode()
+    )
+
+    assert first == []
+    assert second == [kw(1.5)]
+
+
+def test_multiple_readings_in_one_chunk_parse_in_order() -> None:
+    chunk = (
+        f"--graphql\n{make_part(reading_body(1.0))}"
+        f"--graphql\n{make_part('{}')}"
+        f"--graphql\n{make_part(reading_body(2.0))}"
+        "--graphql\n"
+    ).encode()
+
+    _, readings = parse_power_stream_chunk("", chunk)
+
+    assert readings == [kw(1.0), kw(2.0)]
+
+
+def test_closing_marker_is_ignored() -> None:
+    _, readings = parse_power_stream_chunk("", b"--graphql--")
+
+    assert readings == []
+
+
+def test_malformed_json_is_skipped() -> None:
+    chunk = f"--graphql\n{make_part('{not valid json')}--graphql\n".encode()
+
+    _, readings = parse_power_stream_chunk("", chunk)
+
+    assert readings == []
+
+
+def test_crlf_line_endings() -> None:
+    chunk = (
+        "--graphql\r\nContent-Type: application/json\r\n\r\n"
+        + reading_body(4.4)
+        + "\r\n--graphql\r\n"
+    ).encode()
+
+    _, readings = parse_power_stream_chunk("", chunk)
+
+    assert readings == [kw(4.4)]

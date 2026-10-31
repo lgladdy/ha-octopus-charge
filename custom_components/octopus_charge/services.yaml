@@ -1,0 +1,22 @@
+boost_charge_point:
+  target:
+    entity:
+      integration: octopus_charge
+      domain: switch
+  fields:
+    hours:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 12
+          step: 1
+          mode: box
+    minutes:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 45
+          step: 15
+          mode: box

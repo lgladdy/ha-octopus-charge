@@ -1,0 +1,28 @@
+{
+  "entity": {
+    "number": {
+      "led_brightness": { "default": "mdi:brightness-percent" }
+    },
+    "select": {
+      "control_mode": { "default": "mdi:tune" }
+    },
+    "sensor": {
+      "operational_state": { "default": "mdi:ev-station" },
+      "charging_method": { "default": "mdi:ev-plug-type2" },
+      "boost_end_time": { "default": "mdi:clock-fast" },
+      "live_power": { "default": "mdi:lightning-bolt" },
+      "energy": { "default": "mdi:lightning-bolt" },
+      "schedule": { "default": "mdi:calendar-clock" }
+    },
+    "switch": {
+      "eco_mode": { "default": "mdi:leaf" },
+      "random_delay": { "default": "mdi:timer-sand" },
+      "away_mode": { "default": "mdi:home-export-outline" },
+      "cable_auto_lock": { "default": "mdi:lock" },
+      "boost": { "default": "mdi:lightning-bolt-circle" }
+    }
+  },
+  "services": {
+    "boost_charge_point": { "service": "mdi:lightning-bolt-circle" }
+  }
+}

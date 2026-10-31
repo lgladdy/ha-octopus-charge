@@ -1,0 +1,110 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Octopus Energy",
+        "description": "Enter your Octopus Energy API key and account number. You can find both in your [Octopus Energy account](https://octopus.energy/dashboard/new/accounts/personal-details/api-access).",
+        "data": {
+          "api_key": "API key",
+          "account_number": "Account number"
+        },
+        "data_description": {
+          "api_key": "Your personal API key.",
+          "account_number": "Your account number, e.g. A-1234ABCD."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate with Octopus Energy",
+        "description": "The API key for account {account_number} was rejected. Enter a new API key.",
+        "data": {
+          "api_key": "API key"
+        },
+        "data_description": {
+          "api_key": "Your personal API key."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to Octopus Energy. Please try again later.",
+      "invalid_auth": "The API key was rejected.",
+      "invalid_account_number": "That doesn't look like an Octopus Energy account number.",
+      "account_not_found": "That account number could not be found.",
+      "no_charge_point": "No Octopus Charge unit was found on that account.",
+      "unknown": "An unexpected error occurred. See the Home Assistant log for details."
+    },
+    "abort": {
+      "already_configured": "This account is already configured.",
+      "reauth_successful": "Re-authentication was successful."
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "connected": {
+        "name": "Connected"
+      }
+    },
+    "number": {
+      "led_brightness": {
+        "name": "LED brightness"
+      }
+    },
+    "select": {
+      "control_mode": {
+        "name": "Control mode"
+      }
+    },
+    "sensor": {
+      "operational_state": {
+        "name": "Operational state"
+      },
+      "charging_method": {
+        "name": "Charging method"
+      },
+      "boost_end_time": {
+        "name": "Boost end time"
+      },
+      "live_power": {
+        "name": "Live power"
+      },
+      "energy": {
+        "name": "Energy"
+      },
+      "schedule": {
+        "name": "Schedule"
+      }
+    },
+    "switch": {
+      "eco_mode": {
+        "name": "Eco mode"
+      },
+      "random_delay": {
+        "name": "Random delay"
+      },
+      "away_mode": {
+        "name": "Away mode"
+      },
+      "cable_auto_lock": {
+        "name": "Cable auto lock"
+      },
+      "boost": {
+        "name": "Boost"
+      }
+    }
+  },
+  "services": {
+    "boost_charge_point": {
+      "name": "Boost charge point",
+      "description": "Starts a boost charge for a given length of time.",
+      "fields": {
+        "hours": {
+          "name": "Hours",
+          "description": "The number of hours to boost for."
+        },
+        "minutes": {
+          "name": "Minutes",
+          "description": "The number of minutes to boost for."
+        }
+      }
+    }
+  }
+}
