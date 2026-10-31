@@ -121,3 +121,17 @@ def test_crlf_split_across_chunks() -> None:
 
     assert first == []
     assert [reading.value for reading in second] == [7.2]
+
+
+def test_error_parts_are_not_zero_readings() -> None:
+    """An error carries no reading; it mustn't be reported as 0kW."""
+    message = (
+        b"--graphql\r\ncontent-type: application/json\r\n\r\n"
+        b'{"payload":null,"errors":[{"message":"JWT has expired"}]}\r\n'
+        b"--graphql\r\ncontent-type: application/json\r\n\r\n"
+        b'{"payload":{"errors":[{"message":"boom"}]}}\r\n--graphql'
+    )
+
+    _, readings = parse_power_stream_chunk("", message)
+
+    assert readings == []

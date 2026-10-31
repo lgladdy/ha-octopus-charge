@@ -444,6 +444,29 @@ async def test_fresh_token_rejected_again_backs_off_token_retrieval(
     assert len(calls_to(token_mock, KRAKEN_GRAPHQL_URL)) == 2
 
 
+async def test_auth_error_code_for_a_token_in_use_is_retried(
+    client: OctopusChargeApiClient, token_mock: AiohttpClientMocker
+) -> None:
+    """A revoked token reported as an auth error code isn't a bad API key."""
+    auth_error = {
+        "errors": [
+            {"message": "Unauthorized.", "extensions": {"errorCode": "KT-CT-1111"}}
+        ]
+    }
+    responses = iter([{"data": {}}, auth_error, {"data": {}}])
+
+    async def _respond(*_: Any) -> AiohttpClientMockResponse:
+        return AiohttpClientMockResponse(
+            "POST", BACKEND_GRAPHQL_URL, json=next(responses)
+        )
+
+    token_mock.post(BACKEND_GRAPHQL_URL, side_effect=_respond)
+    await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
+
+    assert await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID) == []
+    assert len(calls_to(token_mock, KRAKEN_GRAPHQL_URL)) == 2
+
+
 async def test_404_is_a_request_error(
     client: OctopusChargeApiClient, token_mock: AiohttpClientMocker
 ) -> None:
@@ -676,20 +699,20 @@ async def test_stream_yields_readings(
     assert "subscriptionSpec=1.0" in headers["Accept"]
 
 
-async def test_stream_retries_once_after_unauthorised(
+async def test_stream_refusal_leaves_the_shared_token_alone(
     client: OctopusChargeApiClient, token_mock: AiohttpClientMocker
 ) -> None:
+    """Status polls still use the token; reconnects mustn't churn new ones."""
     token_mock.post(BACKEND_GRAPHQL_URL, side_effect=backend_sequence(200, 401))
     await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
 
-    # Refused even with a fresh token: not something a new API key would fix.
-    with pytest.raises(OctopusChargeRequestError) as exc_info:
-        async for _ in client.async_stream_power(ACCOUNT_NUMBER, DEVICE_UUID):
-            pass
+    for _ in range(3):
+        with pytest.raises(OctopusChargeRequestError) as exc_info:
+            async for _ in client.async_stream_power(ACCOUNT_NUMBER, DEVICE_UUID):
+                pass
+        assert not isinstance(exc_info.value, OctopusChargeAuthError)
 
-    assert not isinstance(exc_info.value, OctopusChargeAuthError)
-    assert len(calls_to(token_mock, KRAKEN_GRAPHQL_URL)) == 2
-    assert len(calls_to(token_mock, BACKEND_GRAPHQL_URL)) == 3
+    assert len(calls_to(token_mock, KRAKEN_GRAPHQL_URL)) == 1
 
 
 async def test_stream_cloudfront_403_keeps_the_token(

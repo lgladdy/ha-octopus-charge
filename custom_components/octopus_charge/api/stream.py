@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 
 from pydantic import ValidationError
 
@@ -12,6 +13,8 @@ from .models import ChargePointPowerReading
 # The multipart boundary used by the charge point live power stream. A fixed
 # literal, never guaranteed to land on a chunk edge.
 MULTIPART_BOUNDARY = "--graphql"
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def parse_power_stream_chunk(
@@ -65,8 +68,13 @@ def parse_power_stream_chunk(
         payload = (
             payload_data.get("payload") if isinstance(payload_data, dict) else None
         )
-        if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
-            raw_reading = payload["data"].get("electricChargerPowerReadings")
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
+            # An error part (transport- or payload-level) carries no reading - it
+            # isn't "no power", so don't report it as 0kW.
+            _LOGGER.debug("Ignoring live power stream part without data: %s", body_text)
+            continue
+
+        raw_reading = payload["data"].get("electricChargerPowerReadings")
 
         reading = None
         if raw_reading is not None:

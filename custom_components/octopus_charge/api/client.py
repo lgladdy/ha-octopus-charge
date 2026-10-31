@@ -526,22 +526,30 @@ class OctopusChargeApiClient:
     ) -> dict[str, Any]:
         """Run an authenticated GraphQL operation.
 
-        If the token is rejected, retry once with a new one retrieved using the
-        API key. Only a failure to retrieve that token means the API key itself
-        is bad; a fresh token being rejected too is something re-entering the key
-        won't fix, so it's reported as a request error rather than an auth error.
+        If a token that has been in use is refused - with an HTTP 401/403 or an
+        auth error code - retry once with a new one retrieved using the API key,
+        since tokens can be revoked or expire early. If a freshly retrieved token
+        is refused too:
+        - with an auth error code, the key itself lacks access, so it is raised
+          as an auth error (prompting reauth);
+        - with an HTTP 401/403, re-entering the key won't fix it, so it is a
+          request error (and counts towards the token retrieval cooldown).
         """
         token, fresh = await self._async_ensure_token()
         while True:
             try:
                 body = await self._async_post(url, {"query": query}, context, token)
                 break
-            except OctopusChargeUnauthenticatedError as err:
-                self._token_rejected(token, fresh=fresh)
-                if fresh:
+            except OctopusChargeAuthError as err:
+                if not fresh:
+                    self._token_rejected(token, fresh=False)
+                elif isinstance(err, OctopusChargeUnauthenticatedError):
+                    self._token_rejected(token, fresh=True)
                     raise OctopusChargeRequestError(
                         f"Request rejected with a newly retrieved token ({context})"
                     ) from err
+                else:
+                    raise
 
             _LOGGER.debug("Token rejected (%s) - retrying with a new one", context)
             token, _ = await self._async_ensure_token()
@@ -748,53 +756,47 @@ class OctopusChargeApiClient:
         }
 
         context = "chargepoint-power-stream"
-        token, fresh = await self._async_ensure_token()
-        while True:
-            headers = {
-                "Authorization": token,
-                "Accept": (
-                    "multipart/mixed;subscriptionSpec=1.0, "
-                    "application/graphql-response+json, application/json"
-                ),
-                "X-APOLLO-OPERATION-NAME": "OctoChargerGetPowerReadings",
-                CONTEXT_HEADER: context,
-                **self._headers,
-            }
+        token, _ = await self._async_ensure_token()
+        headers = {
+            "Authorization": token,
+            "Accept": (
+                "multipart/mixed;subscriptionSpec=1.0, "
+                "application/graphql-response+json, application/json"
+            ),
+            "X-APOLLO-OPERATION-NAME": "OctoChargerGetPowerReadings",
+            CONTEXT_HEADER: context,
+            **self._headers,
+        }
 
-            try:
-                async with self._session.post(
-                    BACKEND_GRAPHQL_URL,
-                    json=payload,
-                    headers=headers,
-                    timeout=self._timeout,
-                ) as response:
-                    if response.status >= 400:
-                        text = await response.text()
-                        try:
-                            self._raise_for_status(response.status, text, context)
-                        except OctopusChargeUnauthenticatedError as err:
-                            # Same handling as _async_graphql: retry once with
-                            # a new token, and a refused fresh token isn't an
-                            # API key problem.
-                            self._token_rejected(token, fresh=fresh)
-                            if fresh:
-                                raise OctopusChargeRequestError(
-                                    "Live power stream rejected a newly retrieved token"
-                                ) from err
-                    else:
-                        self._token_accepted()
-                        buffer = ""
-                        async for chunk in response.content.iter_any():
-                            buffer, readings = parse_power_stream_chunk(buffer, chunk)
-                            for reading in readings:
-                                yield reading
+        try:
+            async with self._session.post(
+                BACKEND_GRAPHQL_URL,
+                json=payload,
+                headers=headers,
+                timeout=self._timeout,
+            ) as response:
+                if response.status >= 400:
+                    text = await response.text()
+                    try:
+                        self._raise_for_status(response.status, text, context)
+                    except OctopusChargeUnauthenticatedError as err:
+                        # Unlike other requests, a refused stream doesn't discard
+                        # or replace the shared token: the status polls are still
+                        # using it, and the stream reconnects every minute or so
+                        # while charging, so it would churn the rate limited token
+                        # endpoint. If the token really is bad, the next poll
+                        # replaces it and the next reconnect picks that up.
+                        raise OctopusChargeRequestError(
+                            "Live power stream refused the token"
+                        ) from err
 
-                        return
-            except (TimeoutError, aiohttp.ClientError) as err:
-                raise OctopusChargeConnectionError(
-                    "Connection lost while streaming charge point power"
-                ) from err
-
-            _LOGGER.debug("Token rejected (%s) - retrying with a new one", context)
-            token, _ = await self._async_ensure_token()
-            fresh = True
+                self._token_accepted()
+                buffer = ""
+                async for chunk in response.content.iter_any():
+                    buffer, readings = parse_power_stream_chunk(buffer, chunk)
+                    for reading in readings:
+                        yield reading
+        except (TimeoutError, aiohttp.ClientError) as err:
+            raise OctopusChargeConnectionError(
+                "Connection lost while streaming charge point power"
+            ) from err
