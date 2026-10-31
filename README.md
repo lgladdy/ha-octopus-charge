@@ -31,7 +31,8 @@ Copy `custom_components/octopus_charge` into your Home Assistant `custom_compone
 
 1. Go to **Settings** → **Devices & Services** → **Add Integration**
 2. Search for **Octopus Charge**
-3. Enter your Octopus Energy **API key** (from your [developer settings](https://octopus.energy/dashboard/new/accounts/personal-details/api-access)) and your **account number** (e.g. `A-1234ABCD`)
+3. If you already use the Octopus Energy integration, choose **Use the API key from my Octopus Energy integration** and pick the account. Its key is copied across, so this integration keeps working on its own.
+   Otherwise, enter your **API key** (from your [developer settings](https://octopus.energy/dashboard/new/accounts/personal-details/api-access)) and your **account number** (e.g. `A-1234ABCD`)
 
 Your account must have an Octopus Charge unit registered against it. If your API key stops working you'll be asked to enter a new one.
 

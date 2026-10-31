@@ -11,6 +11,10 @@
         "data_description": {
           "api_key": "Your personal API key.",
           "account_number": "Your account number, e.g. A-1234ABCD."
+        },
+        "menu_options": {
+          "existing": "Use the API key from my Octopus Energy integration",
+          "manual": "Enter an API key"
         }
       },
       "reauth_confirm": {
@@ -21,6 +25,13 @@
         },
         "data_description": {
           "api_key": "Your personal API key."
+        }
+      },
+      "existing": {
+        "title": "Use your Octopus Energy integration",
+        "description": "Choose the account to set up. Its API key is copied, so this integration keeps working on its own.",
+        "data": {
+          "account_number": "Account"
         }
       }
     },

@@ -29,6 +29,11 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
 )
 STEP_REAUTH_DATA_SCHEMA = vol.Schema({vol.Required(CONF_API_KEY): str})
 
+# The Octopus Energy integration's config entry data keys.
+OCTOPUS_ENERGY_DOMAIN = "octopus_energy"
+OCTOPUS_ENERGY_API_KEY = "api_key"
+OCTOPUS_ENERGY_ACCOUNT_ID = "account_id"
+
 API_KEY_URL = (
     "https://octopus.energy/dashboard/new/accounts/personal-details/api-access"
 )
@@ -68,36 +73,117 @@ class OctopusChargeConfigFlow(ConfigFlow, domain=DOMAIN):
 
         return "no_charge_point"
 
-    async def async_step_user(
-        self, user_input: dict[str, Any] | None = None
+    def _existing_accounts(self) -> dict[str, str]:
+        """Return account number -> API key for the Octopus Energy integration.
+
+        Only accounts that aren't already set up here are offered.
+        """
+        configured = self._async_current_ids()
+        accounts: dict[str, str] = {}
+        for entry in self.hass.config_entries.async_entries(OCTOPUS_ENERGY_DOMAIN):
+            api_key = entry.data.get(OCTOPUS_ENERGY_API_KEY)
+            account_number = entry.data.get(OCTOPUS_ENERGY_ACCOUNT_ID)
+            if (
+                isinstance(api_key, str)
+                and isinstance(account_number, str)
+                and account_number.strip().upper() not in configured
+            ):
+                accounts[account_number.strip().upper()] = api_key.strip()
+
+        return accounts
+
+    async def _async_try_create_entry(
+        self, api_key: str, account_number: str
+    ) -> tuple[ConfigFlowResult | None, str | None]:
+        """Validate the details and create the entry, or return the error key."""
+        await self.async_set_unique_id(account_number)
+        self._abort_if_unique_id_configured()
+
+        if (error := await self._async_validate(api_key, account_number)) is not None:
+            return None, error
+
+        return (
+            self.async_create_entry(
+                title=account_number,
+                data={CONF_API_KEY: api_key, CONF_ACCOUNT_NUMBER: account_number},
+            ),
+            None,
+        )
+
+    def _async_show_user_form(
+        self, user_input: dict[str, Any] | None, errors: dict[str, str]
     ) -> ConfigFlowResult:
-        """Handle the initial step."""
-        errors: dict[str, str] = {}
-
-        if user_input is not None:
-            api_key = user_input[CONF_API_KEY].strip()
-            account_number = user_input[CONF_ACCOUNT_NUMBER].strip().upper()
-
-            await self.async_set_unique_id(account_number)
-            self._abort_if_unique_id_configured()
-
-            if (error := await self._async_validate(api_key, account_number)) is None:
-                return self.async_create_entry(
-                    title=account_number,
-                    data={
-                        CONF_API_KEY: api_key,
-                        CONF_ACCOUNT_NUMBER: account_number,
-                    },
-                )
-
-            errors["base"] = error
-
         return self.async_show_form(
             step_id="user",
             data_schema=self.add_suggested_values_to_schema(
                 STEP_USER_DATA_SCHEMA, user_input
             ),
             description_placeholders={"api_key_url": API_KEY_URL},
+            errors=errors,
+        )
+
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle the initial step.
+
+        If the Octopus Energy integration is set up, first offer to reuse its API
+        key rather than making the user find and paste it again.
+        """
+        if user_input is None and self._existing_accounts():
+            return self.async_show_menu(
+                step_id="user",
+                menu_options=["existing", "manual"],
+                description_placeholders={"api_key_url": API_KEY_URL},
+            )
+
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            result, error = await self._async_try_create_entry(
+                user_input[CONF_API_KEY].strip(),
+                user_input[CONF_ACCOUNT_NUMBER].strip().upper(),
+            )
+            if result is not None:
+                return result
+
+            errors["base"] = error or "unknown"
+
+        return self._async_show_user_form(user_input, errors)
+
+    async def async_step_manual(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Enter an API key by hand (chosen from the menu)."""
+        return self._async_show_user_form(None, {})
+
+    async def async_step_existing(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Reuse the API key from an Octopus Energy integration account."""
+        accounts = self._existing_accounts()
+        if not accounts:
+            return await self.async_step_manual()
+
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            account_number = user_input[CONF_ACCOUNT_NUMBER]
+            result, error = await self._async_try_create_entry(
+                accounts[account_number], account_number
+            )
+            if result is not None:
+                return result
+
+            errors["base"] = error or "unknown"
+
+        return self.async_show_form(
+            step_id="existing",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_ACCOUNT_NUMBER, default=next(iter(accounts))
+                    ): vol.In(list(accounts))
+                }
+            ),
             errors=errors,
         )
 
