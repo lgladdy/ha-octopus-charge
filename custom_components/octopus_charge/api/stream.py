@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 
 from pydantic import ValidationError
 
@@ -12,6 +13,8 @@ from .models import ChargePointPowerReading
 # The multipart boundary used by the charge point live power stream. A fixed
 # literal, never guaranteed to land on a chunk edge.
 MULTIPART_BOUNDARY = "--graphql"
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def parse_power_stream_chunk(
@@ -31,8 +34,9 @@ def parse_power_stream_chunk(
     readings: list[ChargePointPowerReading | None] = []
 
     # Normalise CRLF up front so the boundary/header-body parsing below only
-    # ever has to deal with plain \n.
-    buffer += chunk.decode("utf-8", errors="ignore").replace("\r\n", "\n")
+    # ever has to deal with plain \n. Done on the joined buffer, not the chunk,
+    # because a chunk can end between the \r and the \n.
+    buffer = (buffer + chunk.decode("utf-8", errors="ignore")).replace("\r\n", "\n")
 
     # Buffer across reads and only treat a segment as complete once a boundary
     # after it has arrived.
@@ -64,8 +68,19 @@ def parse_power_stream_chunk(
         payload = (
             payload_data.get("payload") if isinstance(payload_data, dict) else None
         )
-        if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
-            raw_reading = payload["data"].get("electricChargerPowerReadings")
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("data"), dict)
+            or payload_data.get("errors")
+            or payload.get("errors")
+        ):
+            # An error part (transport-, payload- or field-level, the last with a
+            # null reading alongside it) carries no reading - it isn't "no
+            # power", so don't report it as 0kW.
+            _LOGGER.debug("Ignoring live power stream part without data: %s", body_text)
+            continue
+
+        raw_reading = payload["data"].get("electricChargerPowerReadings")
 
         reading = None
         if raw_reading is not None:

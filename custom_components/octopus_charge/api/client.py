@@ -8,13 +8,15 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, NoReturn
 
 import aiohttp
 from homeassistant.util import dt as dt_util
+from pydantic import ValidationError
 
 from .exceptions import (
     OctopusChargeAuthError,
+    OctopusChargeCannotConnectError,
     OctopusChargeConnectionError,
     OctopusChargeError,
     OctopusChargeRequestError,
@@ -193,6 +195,12 @@ def _bool(value: bool) -> str:
     return "true" if value else "false"
 
 
+def _excerpt(text: str, limit: int = 200) -> str:
+    """Return the start of a response body for an error message."""
+    text = " ".join(text.split())
+    return text if len(text) <= limit else f"{text[:limit]}..."
+
+
 def calculate_token_retrieval_cooldown(failure_count: int) -> timedelta:
     """Return how long to wait before retrieving a token after repeated failures."""
     if failure_count < 1:
@@ -236,7 +244,12 @@ def _select_current_property_ids(properties: list[dict[str, Any]]) -> list[str]:
 
         for period in prop.get("occupancyPeriods") or []:
             effective_to = period.get("effectiveTo")
-            ends = dt_util.parse_datetime(effective_to) if effective_to else None
+            parsed = dt_util.parse_datetime(effective_to) if effective_to else None
+            # An offset-less value can't be compared with an aware "now"; Kraken
+            # works in UTC, so treat it as UTC.
+            if parsed is not None and parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            ends = parsed
             if (effective_to is None or ends is None or ends > now) and (
                 property_id not in current
             ):
@@ -271,6 +284,10 @@ class OctopusChargeApiClient:
         self._is_api_key_invalid = False
         self._token_retrieval_failures = 0
         self._token_retrieval_cooldown_until: datetime | None = None
+        # Whether any request has been accepted with the current token yet, and
+        # the last token whose refusal was counted towards the cooldown.
+        self._token_confirmed = False
+        self._failure_counted_for: str | None = None
 
     # ------------------------------------------------------------------
     # Authentication
@@ -284,18 +301,22 @@ class OctopusChargeApiClient:
 
     def _reset_tokens(self) -> None:
         self._token = None
+        self._token_confirmed = False
         self._token_expiry = None
         self._refresh_token = None
         self._refresh_token_expiry = None
 
-    async def _async_ensure_token(self) -> str:
-        """Return a valid auth token, retrieving one if needed."""
+    async def _async_ensure_token(self) -> tuple[str, bool]:
+        """Return a valid auth token, retrieving one if needed.
+
+        Also returns whether the token was retrieved by this call.
+        """
         if self._is_token_valid():
-            return self._token  # type: ignore[return-value]
+            return self._token, False  # type: ignore[return-value]
 
         async with self._token_lock:
             if self._is_token_valid():
-                return self._token  # type: ignore[return-value]
+                return self._token, False  # type: ignore[return-value]
 
             if self._is_api_key_invalid:
                 raise OctopusChargeAuthError("API key has been marked as invalid")
@@ -318,45 +339,96 @@ class OctopusChargeApiClient:
                 self._refresh_token = None
 
             try:
-                try:
-                    await self._async_fetch_token()
-                except OctopusChargeAuthError:
-                    if self._refresh_token is None:
-                        self._is_api_key_invalid = True
-                        raise
-
-                    _LOGGER.debug(
-                        "Refreshing with the refresh token failed - trying the API key"
-                    )
-                    self._reset_tokens()
-                    try:
-                        await self._async_fetch_token()
-                    except OctopusChargeAuthError:
-                        self._is_api_key_invalid = True
-                        raise
+                await self._async_retrieve_token()
             except OctopusChargeAuthError:
+                self._is_api_key_invalid = True
+                raise
+            except OctopusChargeCannotConnectError:
+                # Never sent, so it can't count towards Octopus's rate limit; the
+                # callers' own retry backoff paces the next attempt. (A timeout
+                # may come after Octopus received the request, so it still gets
+                # the cooldown below.)
                 raise
             except OctopusChargeError:
                 # Any other failure (server error, rate limit reported as a
-                # GraphQL error, connection failure...) gets the cooldown, so a
-                # struggling or rate limiting token endpoint isn't hit again on
-                # every request.
-                self._token_retrieval_failures += 1
-                self._token_retrieval_cooldown_until = (
-                    dt_util.utcnow()
-                    + calculate_token_retrieval_cooldown(self._token_retrieval_failures)
-                )
-                _LOGGER.debug(
-                    "Failed to retrieve a token %s time(s) in a row - not trying "
-                    "again until %s",
-                    self._token_retrieval_failures,
-                    self._token_retrieval_cooldown_until,
-                )
+                # GraphQL error...) gets the cooldown, so a struggling or rate
+                # limiting token endpoint isn't hit again on every request.
+                self._record_token_retrieval_failure()
                 raise
 
-            self._token_retrieval_failures = 0
+            # The failure count is only reset once a request is accepted with the
+            # new token (see _token_accepted), so tokens that are retrieved but
+            # then refused still back off further each time.
             self._token_retrieval_cooldown_until = None
-            return self._token  # type: ignore[return-value]
+            return self._token, True  # type: ignore[return-value]
+
+    async def _async_retrieve_token(self) -> None:
+        """Retrieve a token, preferring the refresh token over the API key.
+
+        Only the API key being refused means the key itself is bad: a refused
+        refresh token (expired, revoked...) falls back to the API key.
+        """
+        if self._refresh_token is not None:
+            try:
+                await self._async_fetch_token()
+            except OctopusChargeAuthError:
+                _LOGGER.debug(
+                    "Refreshing with the refresh token failed - trying the API key"
+                )
+                self._reset_tokens()
+            else:
+                return
+
+        await self._async_fetch_token()
+
+    def _record_token_retrieval_failure(self) -> None:
+        """Count a failed token retrieval and start (or lengthen) the cooldown."""
+        self._token_retrieval_failures += 1
+        self._token_retrieval_cooldown_until = (
+            dt_util.utcnow()
+            + calculate_token_retrieval_cooldown(self._token_retrieval_failures)
+        )
+        _LOGGER.debug(
+            "Failed to retrieve a usable token %s time(s) in a row - not trying "
+            "again until %s",
+            self._token_retrieval_failures,
+            self._token_retrieval_cooldown_until,
+        )
+
+    def _is_untested(self, token: str, *, retrieved: bool) -> bool:
+        """Return whether no request has been accepted with this token yet.
+
+        Tracked on the shared token, not just by the call that retrieved it, so
+        concurrent requests reusing a brand new token treat it as untested too.
+        """
+        return retrieved or (token == self._token and not self._token_confirmed)
+
+    def _token_rejected(self, token: str, *, untested: bool) -> None:
+        """Handle Octopus refusing a request's token.
+
+        The token is thrown away so a later attempt retrieves a new one with the
+        API key - but only if it is still the current one, so a late rejection
+        can't discard a token another request just retrieved. A token that has
+        never been accepted being refused is something retrieving yet another one
+        straight away won't fix, so it also counts (once, however many requests
+        it was refused for) towards the cooldown, which then paces the next
+        retrieval instead of every request spending the rate limited endpoint.
+        """
+        if untested and self._failure_counted_for != token:
+            self._failure_counted_for = token
+            self._record_token_retrieval_failure()
+        if self._token == token:
+            self._reset_tokens()
+
+    def _token_accepted(self, token: str) -> None:
+        """Note that a request was accepted, ending any run of token failures.
+
+        Only for the current token: a late success with a token that has since
+        been replaced says nothing about the replacement.
+        """
+        if token == self._token:
+            self._token_confirmed = True
+            self._token_retrieval_failures = 0
 
     async def _async_fetch_token(self) -> None:
         if self._refresh_token is None:
@@ -369,18 +441,28 @@ class OctopusChargeApiClient:
             {"query": TOKEN_MUTATION.format(credential=credential)},
             "refresh-token",
         )
-        token = ((body or {}).get("data") or {}).get("obtainKrakenToken")
-        if not token or not all(
-            key in token for key in ("token", "refreshToken", "refreshExpiresIn")
-        ):
-            raise OctopusChargeAuthError("Failed to retrieve an auth token")
+        token = (body.get("data") or {}).get("obtainKrakenToken")
+        try:
+            access_token = token["token"]
+            refresh_token = token["refreshToken"]
+            refresh_expiry = datetime.fromtimestamp(token["refreshExpiresIn"], tz=UTC)
+        except (KeyError, TypeError, ValueError, OverflowError, OSError) as err:
+            # A malformed response says nothing about whether the key is valid -
+            # Octopus reports a rejected key as a GraphQL error.
+            raise OctopusChargeRequestError(
+                "Unexpected response when retrieving an auth token"
+            ) from err
+        if not isinstance(access_token, str) or not isinstance(refresh_token, str):
+            raise OctopusChargeRequestError(
+                "Unexpected response when retrieving an auth token"
+            )
 
-        self._token = token["token"]
-        self._refresh_token = token["refreshToken"]
-        self._refresh_token_expiry = datetime.fromtimestamp(
-            token["refreshExpiresIn"], tz=UTC
-        )
-        self._token_expiry = _decode_jwt_expiry(self._token)
+        self._token = access_token
+        self._token_confirmed = False
+        self._failure_counted_for = None
+        self._refresh_token = refresh_token
+        self._refresh_token_expiry = refresh_expiry
+        self._token_expiry = _decode_jwt_expiry(access_token)
 
     # ------------------------------------------------------------------
     # Request plumbing
@@ -391,7 +473,7 @@ class OctopusChargeApiClient:
         payload: dict[str, Any],
         context: str,
         token: str | None = None,
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any]:
         """POST a GraphQL payload and return the decoded, error-checked response."""
         headers = {CONTEXT_HEADER: context, **self._headers}
         if token is not None:
@@ -403,6 +485,11 @@ class OctopusChargeApiClient:
             ) as response:
                 text = await response.text()
                 status = response.status
+        except aiohttp.ClientConnectorError as err:
+            _LOGGER.warning("Failed to connect (%s): %s", context, type(err).__name__)
+            raise OctopusChargeCannotConnectError(
+                f"Failed to connect ({context})"
+            ) from err
         except (TimeoutError, aiohttp.ClientError) as err:
             _LOGGER.warning("Failed to connect (%s): %s", context, type(err).__name__)
             raise OctopusChargeConnectionError(
@@ -411,36 +498,32 @@ class OctopusChargeApiClient:
 
         return self._process_response(status, text, context)
 
-    def _process_response(
-        self, status: int, text: str, context: str
-    ) -> dict[str, Any] | None:
-        if status >= 400:
-            if status >= 500 or status == 429:
-                raise OctopusChargeServerError(
-                    f"Octopus server error ({context}): {status}; {text}"
-                )
-
-            if status in (401, 403):
-                # Cloudfront errors are returned as 403s, so check the body to
-                # tell them apart from an unauthenticated request.
-                if status == 403 and "The request could not be satisfied" in text:
-                    raise OctopusChargeServerError(
-                        f"Octopus server error ({context}): {status}"
-                    )
-
-                # Force re-authentication on the next request.
-                self._reset_tokens()
-                raise OctopusChargeUnauthenticatedError(
-                    f"Unauthenticated request ({context}): {status}"
-                )
-
-            if status == 404:
-                _LOGGER.info("Unexpected 404 response (%s)", context)
-                return None
-
-            raise OctopusChargeRequestError(
-                f"Request failed ({context}): {status}; {text}"
+    def _raise_for_status(self, status: int, text: str, context: str) -> NoReturn:
+        """Raise the error for an HTTP error status (400 and above)."""
+        if status >= 500 or status == 429:
+            raise OctopusChargeServerError(
+                f"Octopus server error ({context}): {status}; {_excerpt(text)}"
             )
+
+        if status in (401, 403):
+            # Cloudfront errors are returned as 403s, so check the body to tell
+            # them apart from an unauthenticated request.
+            if status == 403 and "The request could not be satisfied" in text:
+                raise OctopusChargeServerError(
+                    f"Octopus server error ({context}): {status}"
+                )
+
+            raise OctopusChargeUnauthenticatedError(
+                f"Unauthenticated request ({context}): {status}"
+            )
+
+        raise OctopusChargeRequestError(
+            f"Request failed ({context}): {status}; {_excerpt(text)}"
+        )
+
+    def _process_response(self, status: int, text: str, context: str) -> dict[str, Any]:
+        if status >= 400:
+            self._raise_for_status(status, text, context)
 
         try:
             data = json.loads(text)
@@ -449,7 +532,10 @@ class OctopusChargeApiClient:
                 f"Failed to decode response ({context})"
             ) from err
 
-        errors = data.get("errors") if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            raise OctopusChargeRequestError(f"Unexpected response ({context})")
+
+        errors = data.get("errors")
         if errors:
             messages = [str(error.get("message", "")).strip(".,!") for error in errors]
             for error in errors:
@@ -471,29 +557,38 @@ class OctopusChargeApiClient:
     ) -> dict[str, Any]:
         """Run an authenticated GraphQL operation.
 
-        If the token is rejected, retry once with a new one retrieved using the
-        API key. Only a failure to retrieve that token means the API key itself
-        is bad; a fresh token being rejected too is something re-entering the key
-        won't fix, so it's reported as a request error rather than an auth error.
+        If a token that has been in use is refused - with an HTTP 401/403 or an
+        auth error code - retry once with a new one retrieved using the API key,
+        since tokens can be revoked or expire early. If a freshly retrieved token
+        is refused too:
+        - with an auth error code, the key itself lacks access, so it is raised
+          as an auth error (prompting reauth);
+        - with an HTTP 401/403, re-entering the key won't fix it, so it is a
+          request error (and counts towards the token retrieval cooldown).
         """
-        for attempt in range(2):
-            token = await self._async_ensure_token()
+        token, retrieved = await self._async_ensure_token()
+        while True:
             try:
                 body = await self._async_post(url, {"query": query}, context, token)
-            except OctopusChargeUnauthenticatedError as err:
-                if attempt == 0:
-                    _LOGGER.debug(
-                        "Token rejected (%s) - retrying with a new one", context
-                    )
-                    continue
+                break
+            except OctopusChargeAuthError as err:
+                untested = self._is_untested(token, retrieved=retrieved)
+                if not untested:
+                    self._token_rejected(token, untested=False)
+                elif isinstance(err, OctopusChargeUnauthenticatedError):
+                    self._token_rejected(token, untested=True)
+                    raise OctopusChargeRequestError(
+                        f"Request rejected with a newly retrieved token ({context})"
+                    ) from err
+                else:
+                    raise
 
-                raise OctopusChargeRequestError(
-                    f"Request rejected with a newly retrieved token ({context})"
-                ) from err
+            _LOGGER.debug("Token rejected (%s) - retrying with a new one", context)
+            token, retrieved = await self._async_ensure_token()
+            retrieved = True
 
-            return (body or {}).get("data") or {}
-
-        raise AssertionError("unreachable")  # pragma: no cover
+        self._token_accepted(token)
+        return body.get("data") or {}
 
     # ------------------------------------------------------------------
     # Account / discovery
@@ -521,10 +616,15 @@ class OctopusChargeApiClient:
             "chargepoint-configuration",
         )
         at_location = data.get("chargePointsAtLocation") or {}
-        return [
-            OnboardedChargePoint.model_validate(charge_point)
-            for charge_point in at_location.get("chargePoints") or []
-        ]
+        try:
+            return [
+                OnboardedChargePoint.model_validate(charge_point)
+                for charge_point in at_location.get("chargePoints") or []
+            ]
+        except ValidationError as err:
+            raise OctopusChargeRequestError(
+                "Unexpected charge point data from Octopus"
+            ) from err
 
     async def async_get_schedules(
         self, account_number: str, device_uuid: str
@@ -540,10 +640,15 @@ class OctopusChargeApiClient:
         if schedules is None:
             return None
 
-        return [
-            ChargePointDaySchedule.model_validate(day)
-            for day in schedules.get("schedules") or []
-        ]
+        try:
+            return [
+                ChargePointDaySchedule.model_validate(day)
+                for day in schedules.get("schedules") or []
+            ]
+        except ValidationError as err:
+            raise OctopusChargeRequestError(
+                "Unexpected charge point schedule from Octopus"
+            ) from err
 
     # ------------------------------------------------------------------
     # Controls
@@ -682,54 +787,54 @@ class OctopusChargeApiClient:
             },
         }
 
-        for attempt in range(2):
-            token = await self._async_ensure_token()
-            headers = {
-                "Authorization": token,
-                "Accept": (
-                    "multipart/mixed;subscriptionSpec=1.0, "
-                    "application/graphql-response+json, application/json"
-                ),
-                "X-APOLLO-OPERATION-NAME": "OctoChargerGetPowerReadings",
-                CONTEXT_HEADER: "chargepoint-power-stream",
-                **self._headers,
-            }
+        context = "chargepoint-power-stream"
+        token, _ = await self._async_ensure_token()
+        headers = {
+            "Authorization": token,
+            "Accept": (
+                "multipart/mixed;subscriptionSpec=1.0, "
+                "application/graphql-response+json, application/json"
+            ),
+            "X-APOLLO-OPERATION-NAME": "OctoChargerGetPowerReadings",
+            CONTEXT_HEADER: context,
+            **self._headers,
+        }
 
-            try:
-                async with self._session.post(
-                    BACKEND_GRAPHQL_URL,
-                    json=payload,
-                    headers=headers,
-                    timeout=self._timeout,
-                ) as response:
-                    if response.status in (401, 403):
-                        # Re-authenticate and retry once before giving up.
-                        self._reset_tokens()
-                        if attempt == 0:
-                            continue
-
-                        raise OctopusChargeAuthError(
-                            "Authentication failed while streaming charge point power"
-                        )
-
-                    if response.status >= 500 or response.status == 429:
-                        raise OctopusChargeServerError(
-                            f"Octopus server error while streaming: {response.status}"
-                        )
-
-                    if response.status >= 400:
+        try:
+            async with self._session.post(
+                BACKEND_GRAPHQL_URL,
+                json=payload,
+                headers=headers,
+                timeout=self._timeout,
+            ) as response:
+                if response.status >= 400:
+                    text = await response.text()
+                    try:
+                        self._raise_for_status(response.status, text, context)
+                    except OctopusChargeUnauthenticatedError as err:
+                        # Unlike other requests, a refused stream doesn't discard
+                        # or replace the shared token: the status polls are still
+                        # using it, and the stream reconnects every minute or so
+                        # while charging, so it would churn the rate limited token
+                        # endpoint. If the token really is bad, the next poll
+                        # replaces it and the next reconnect picks that up.
                         raise OctopusChargeRequestError(
-                            f"HTTP error while streaming: {response.status}"
-                        )
+                            "Live power stream refused the token"
+                        ) from err
 
-                    buffer = ""
-                    async for chunk in response.content.iter_any():
-                        buffer, readings = parse_power_stream_chunk(buffer, chunk)
-                        for reading in readings:
-                            yield reading
-
-                    return
-            except (TimeoutError, aiohttp.ClientError) as err:
-                raise OctopusChargeConnectionError(
-                    "Connection lost while streaming charge point power"
-                ) from err
+                # A 200 can still carry nothing but (auth) error parts, so the
+                # token only counts as accepted once a reading arrives - error
+                # parts are skipped by the parser.
+                accepted = False
+                buffer = ""
+                async for chunk in response.content.iter_any():
+                    buffer, readings = parse_power_stream_chunk(buffer, chunk)
+                    for reading in readings:
+                        if not accepted:
+                            self._token_accepted(token)
+                            accepted = True
+                        yield reading
+        except (TimeoutError, aiohttp.ClientError) as err:
+            raise OctopusChargeConnectionError(
+                "Connection lost while streaming charge point power"
+            ) from err

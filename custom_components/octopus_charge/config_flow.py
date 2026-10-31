@@ -161,12 +161,15 @@ class OctopusChargeConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Reuse the API key from an Octopus Energy integration account."""
         accounts = self._existing_accounts()
-        if not accounts:
+        if not accounts and user_input is None:
             return await self.async_step_manual()
 
         errors: dict[str, str] = {}
         if user_input is not None:
             account_number = user_input[CONF_ACCOUNT_NUMBER]
+            if account_number not in accounts:
+                # Set up by another flow since this form was shown.
+                return self.async_abort(reason="already_configured")
             result, error = await self._async_try_create_entry(
                 accounts[account_number], account_number
             )

@@ -93,7 +93,7 @@ Starting or stopping a boost polls every 10 seconds for a minute, so the state r
 
 ## Using it alongside Octopus Energy
 
-The two integrations are independent and can both be set up with the same API key. Octopus Charge creates its own device, so you will no longer see charger entities attached to an Intelligent Octopus Go device.
+The two integrations are independent and can both be set up with the same API key. Octopus Charge creates its own device for the charger.
 
 ## Troubleshooting
 

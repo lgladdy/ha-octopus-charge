@@ -37,6 +37,10 @@ MAX_RETRY_SECONDS = 30 * 60
 
 DEFAULT_BOOST_DURATION = timedelta(hours=1)
 
+# How long a value just sent to the charger is shown while polls still return
+# the old one (Octopus can take a while to reflect a change).
+OPTIMISTIC_TIMEOUT = timedelta(minutes=2)
+
 OPERATIONAL_STATES = [
     "CHARGING",
     "BOOST_CHARGING",

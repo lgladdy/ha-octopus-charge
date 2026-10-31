@@ -12,6 +12,7 @@ import pytest
 from freezegun.api import FrozenDateTimeFactory
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
@@ -28,13 +29,14 @@ from custom_components.octopus_charge.const import (
     BURST_INTERVAL_SECONDS,
     DOMAIN,
     SCAN_INTERVAL,
+    SCHEDULE_SCAN_INTERVAL,
 )
 from custom_components.octopus_charge.coordinator import (
     OctopusChargeCoordinator,
     OctopusChargeScheduleCoordinator,
 )
 
-from .conftest import PROPERTY_ID, charge_point
+from .conftest import DEVICE_UUID, PROPERTY_ID, charge_point
 
 REAL_SLEEP = asyncio.sleep
 
@@ -219,20 +221,22 @@ async def test_repeated_triggers_inside_the_interval_are_ignored(
     assert coordinator._burst_task is first
 
 
-async def test_a_later_trigger_replaces_the_running_burst(
+async def test_a_later_trigger_extends_the_running_burst(
     coordinator: OctopusChargeCoordinator,
     freezer: FrozenDateTimeFactory,
 ) -> None:
+    """Retriggering never cancels the running burst (or a refresh it's in)."""
     coordinator.async_start_burst_refresh()
     first = coordinator._burst_task
+    first_until = coordinator._burst_until
 
     freezer.tick(timedelta(seconds=BURST_INTERVAL_SECONDS + 1))
     coordinator.async_start_burst_refresh()
     await _let_tasks_run()
 
-    assert coordinator._burst_task is not first
-    assert first.cancelled()  # type: ignore[union-attr]
-    assert not coordinator._burst_task.done()  # type: ignore[union-attr]
+    assert coordinator._burst_task is first
+    assert not first.done()  # type: ignore[union-attr]
+    assert coordinator._burst_until > first_until  # type: ignore[operator]
 
 
 async def test_burst_stops_when_requests_are_failing(
@@ -343,6 +347,55 @@ async def test_scheduled_transitions_trigger_a_burst_and_rearm_for_the_next_one(
         timers[0][0](dt_util.utcnow())
         burst.assert_called_once()
         assert timers[1][1] == datetime(2026, 9, 1, 1, 59, 55, tzinfo=UTC)
+
+
+async def test_an_unchanged_schedule_keeps_its_timer(
+    schedule_coordinator: OctopusChargeScheduleCoordinator,
+) -> None:
+    """Re-arming from "now" on every poll could drop or repeat a boundary."""
+    timer = next(iter(schedule_coordinator._cancel_timers.values()))
+
+    await schedule_coordinator.async_refresh()
+
+    assert next(iter(schedule_coordinator._cancel_timers.values())) is timer
+
+
+async def test_a_removed_charge_point_loses_its_schedule_and_timer(
+    coordinator: OctopusChargeCoordinator,
+    schedule_coordinator: OctopusChargeScheduleCoordinator,
+    mock_client: AsyncMock,
+) -> None:
+    mock_client.async_get_charge_points.return_value = []
+    await coordinator.async_refresh()
+    await schedule_coordinator.async_refresh()
+
+    assert schedule_coordinator.data == {}
+    assert not schedule_coordinator._cancel_timers
+
+
+async def test_schedule_keeps_polling_without_the_schedule_sensor(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_client: AsyncMock,
+    entity_registry: er.EntityRegistry,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    entity_registry.async_get_or_create(
+        "sensor",
+        DOMAIN,
+        f"{DEVICE_UUID}_schedule",
+        disabled_by=er.RegistryEntryDisabler.USER,
+    )
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+    fetches = mock_client.async_get_schedules.await_count
+
+    freezer.tick(SCHEDULE_SCAN_INTERVAL + timedelta(seconds=1))
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+
+    assert mock_client.async_get_schedules.await_count > fetches
 
 
 async def test_unloading_cancels_the_transition_timers(

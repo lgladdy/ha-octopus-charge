@@ -60,8 +60,11 @@ class OctopusChargeLedBrightnessNumber(OctopusChargeEntity, NumberEntity):
 
     async def async_set_native_value(self, value: float) -> None:
         """Set the LED brightness percentage."""
-        await self.coordinator.client.async_set_led_brightness(
-            self.coordinator.account_number, self._device_uuid, int(value)
+        brightness = int(value)
+        await self._async_send(
+            self.coordinator.client.async_set_led_brightness(
+                self.coordinator.account_number, self._device_uuid, brightness
+            )
         )
-        self._optimistic.set(value)
+        self._optimistic.set(brightness)
         self.async_write_ha_state()

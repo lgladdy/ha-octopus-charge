@@ -31,24 +31,32 @@ def compute_next_schedule_transition(
     the schedule has no periods at all.
     """
     candidates: list[datetime] = []
-    # Today plus a full week, to catch "next week" wraparound.
-    for day_offset in range(8):
+    # Yesterday (whose overnight period can end today) through a full week
+    # ahead, to catch "next week" wraparound.
+    for day_offset in range(-1, 8):
         day = now + timedelta(days=day_offset)
         periods = schedule_by_day.get(DAY_NAMES[day.weekday()], [])
         for period in periods:
-            for key in ("start", "end"):
-                time_str = period.get(key)
-                if not time_str:
-                    continue
-                try:
-                    hour, minute = (int(part) for part in time_str.split(":")[:2])
-                    candidate = day.replace(
-                        hour=hour, minute=minute, second=0, microsecond=0
-                    )
-                except ValueError, AttributeError:
-                    continue
+            start = _time_on(day, period.get("start"))
+            end = _time_on(day, period.get("end"))
+            # A period that ends at or before it starts (e.g. 23:00-06:00, or
+            # 18:00-00:00) runs past midnight, so it ends on the next day.
+            if start is not None and end is not None and end <= start:
+                end += timedelta(days=1)
 
-                if candidate > now:
-                    candidates.append(candidate)
+            candidates.extend(
+                boundary for boundary in (start, end) if boundary and boundary > now
+            )
 
     return min(candidates) if candidates else None
+
+
+def _time_on(day: datetime, time_str: Any) -> datetime | None:
+    """Return an "HH:MM" schedule time on the given day, or None if invalid."""
+    if not time_str:
+        return None
+    try:
+        hour, minute = (int(part) for part in time_str.split(":")[:2])
+        return day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    except ValueError, AttributeError:
+        return None

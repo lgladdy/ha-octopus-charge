@@ -71,16 +71,20 @@ class OctopusChargeCoordinator(DataUpdateCoordinator[dict[str, OnboardedChargePo
         )
         self.client = client
         self.account_number: str = entry.data[CONF_ACCOUNT_NUMBER]
-        # When the data was last successfully retrieved from Octopus.
+        # When the latest successful poll started (its data is as of then).
         self.last_retrieved: datetime | None = None
 
         self._property_ids: list[str] | None = None
         self._consecutive_failures = 0
         self._burst_task: asyncio.Task[None] | None = None
-        self._last_burst_started_at: datetime | None = None
+        self._burst_until: datetime | None = None
 
     async def _async_update_data(self) -> dict[str, OnboardedChargePoint]:
         """Fetch the account's charge points."""
+        # Stamped with when the request started, not finished: the data is "as
+        # of" then, so a poll already in flight when a command was sent can't
+        # count as having seen it (see OptimisticValue).
+        started = dt_util.utcnow()
         try:
             if self._property_ids is None:
                 property_ids = await self.client.async_get_property_ids(
@@ -110,56 +114,39 @@ class OctopusChargeCoordinator(DataUpdateCoordinator[dict[str, OnboardedChargePo
             ) from err
 
         self._consecutive_failures = 0
-        self.last_retrieved = dt_util.utcnow()
+        self.last_retrieved = started
         return charge_points
 
     @callback
-    def async_start_burst_refresh(
-        self,
-        interval_seconds: int = BURST_INTERVAL_SECONDS,
-        duration_seconds: int = BURST_DURATION_SECONDS,
-    ) -> None:
-        """(Re)start a short burst of frequent polling.
+    def async_start_burst_refresh(self) -> None:
+        """Start, or extend, a short burst of frequent polling.
 
         Used right after something is expected to change on the charger (boost
         toggled, a scheduled period starting/ending) so dependent entities - like
         live power - pick up the change quickly rather than waiting up to a full
         scan interval.
 
-        This is the one place every trigger funnels through, so it also guards
-        against toggling boost rapidly to sustain fast polling indefinitely: a
-        call within ``interval_seconds`` of the previous one is ignored.
+        Triggering again while a burst runs only extends it: a single loop polls
+        at most once per burst interval however often it is triggered (so
+        toggling boost rapidly can't poll any faster), and a refresh in flight is
+        never cancelled - Home Assistant would mark the coordinator as failed,
+        making every entity briefly unavailable.
         """
-        now = dt_util.utcnow()
-        if (
-            self._last_burst_started_at is not None
-            and (now - self._last_burst_started_at).total_seconds() < interval_seconds
-        ):
-            return
+        self._burst_until = dt_util.utcnow() + timedelta(seconds=BURST_DURATION_SECONDS)
+        if self._burst_task is None or self._burst_task.done():
+            self._burst_task = self.config_entry.async_create_background_task(
+                self.hass, self._async_run_burst(), name=f"{DOMAIN} burst refresh"
+            )
 
-        self._last_burst_started_at = now
-        if self._burst_task is not None and not self._burst_task.done():
-            self._burst_task.cancel()
-
-        self._burst_task = self.config_entry.async_create_background_task(
-            self.hass,
-            self._async_run_burst(interval_seconds, duration_seconds),
-            name=f"{DOMAIN} burst refresh",
-        )
-
-    async def _async_run_burst(
-        self, interval_seconds: int, duration_seconds: int
-    ) -> None:
+    async def _async_run_burst(self) -> None:
         # Each refresh below also reschedules the normal poll, so for the
         # duration of the burst this loop is the only thing polling, and the
         # normal schedule resumes by itself once it ends.
-        end = dt_util.utcnow() + timedelta(seconds=duration_seconds)
-        while dt_util.utcnow() < end:
+        while self._burst_until is not None and dt_util.utcnow() < self._burst_until:
             # Wait a full interval before polling - the change we're bursting
             # around (e.g. a boost toggle) hasn't necessarily propagated on
-            # Octopus's side yet, so an immediate poll can catch the charger
-            # still in its pre-change state and read as an instant revert.
-            await asyncio.sleep(interval_seconds)
+            # Octopus's side yet.
+            await asyncio.sleep(BURST_INTERVAL_SECONDS)
 
             # Already backed off after repeated failures - don't keep hammering
             # a server that's failing; the normal retry schedule takes over.
@@ -207,13 +194,19 @@ class OctopusChargeScheduleCoordinator(DataUpdateCoordinator[dict[str, ScheduleB
 
     async def _async_update_data(self) -> dict[str, ScheduleByDay]:
         """Fetch the weekly schedule of every known charge point."""
-        data: dict[str, ScheduleByDay] = dict(self.data or {})
+        previous: dict[str, ScheduleByDay] = self.data or {}
+        # Only charge points that still exist - a removed one's schedule (and its
+        # transition timer) would otherwise linger until a restart.
+        data: dict[str, ScheduleByDay] = {}
         try:
             for device_uuid in self._status_coordinator.data or {}:
                 schedules = await self.client.async_get_schedules(
                     self.account_number, device_uuid
                 )
                 if schedules is None:
+                    # Keep the last known schedule rather than dropping it.
+                    if device_uuid in previous:
+                        data[device_uuid] = previous[device_uuid]
                     continue
 
                 data[device_uuid] = {
@@ -240,8 +233,19 @@ class OctopusChargeScheduleCoordinator(DataUpdateCoordinator[dict[str, ScheduleB
             ) from err
 
         self._consecutive_failures = 0
+        for device_uuid in self._cancel_timers.keys() - data.keys():
+            self._cancel_timers.pop(device_uuid)()
+
         for device_uuid, schedule in data.items():
-            self._async_arm_transition_timer(device_uuid, schedule)
+            # Re-arming an unchanged schedule from "now" could drop or repeat the
+            # burst for a boundary whose timer is about to fire (timers fire up
+            # to SCHEDULE_BURST_LEAD_SECONDS early and the jitter late), so only
+            # re-arm when the schedule actually changed.
+            if (
+                schedule != previous.get(device_uuid)
+                or device_uuid not in self._cancel_timers
+            ):
+                self._async_arm_transition_timer(device_uuid, schedule)
 
         return data
 

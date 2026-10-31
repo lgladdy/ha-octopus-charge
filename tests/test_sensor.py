@@ -26,8 +26,9 @@ from custom_components.octopus_charge.api.models import (
     ChargePointDaySchedule,
     ChargePointPowerReading,
 )
+from custom_components.octopus_charge.const import DOMAIN
 
-from .conftest import charge_point, update_charge_point
+from .conftest import DEVICE_UUID, charge_point, update_charge_point
 
 OPERATIONAL_STATE = "sensor.octopus_charge_operational_state"
 CHARGING_METHOD = "sensor.octopus_charge_charging_method"
@@ -120,6 +121,16 @@ async def test_boost_end_time(
     assert hass.states.get(BOOST_END).state == STATE_UNKNOWN
 
 
+async def test_boost_end_time_without_an_offset_is_utc(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client: AsyncMock
+) -> None:
+    await update_charge_point(
+        hass, setup_integration, mock_client, boostEndTime="2026-09-01T10:30:00"
+    )
+
+    assert hass.states.get(BOOST_END).state == "2026-09-01T10:30:00+00:00"
+
+
 # --- schedule ---------------------------------------------------------------
 
 
@@ -170,6 +181,9 @@ async def test_schedule_sensor_unavailable_without_a_schedule(
 # --- live power -------------------------------------------------------------
 
 
+END = Exception("end of stream")
+
+
 class FakeStream:
     """A controllable stand-in for the live power stream."""
 
@@ -185,9 +199,15 @@ class FakeStream:
         self.connections += 1
         while True:
             item = await self.readings.get()
+            if item is END:
+                return
             if isinstance(item, Exception):
                 raise item
             yield item
+
+    def end(self) -> None:
+        """End the current stream cleanly, as the server closing it would."""
+        self.readings.put_nowait(END)
 
     def push(self, kw: float | None) -> None:
         self.readings.put_nowait(
@@ -355,80 +375,183 @@ async def test_unloading_stops_the_stream(
 # --- energy -----------------------------------------------------------------
 
 
+async def _push(hass: HomeAssistant, stream: FakeStream, kw: float | None) -> None:
+    stream.push(kw)
+    await _yield()
+    await hass.async_block_till_done()
+
+
+async def _set_state(
+    hass: HomeAssistant, entry: MockConfigEntry, client: AsyncMock, state: str
+) -> None:
+    await update_charge_point(hass, entry, client, operationalState=state)
+    await _yield()
+    await hass.async_block_till_done()
+
+
+def _energy(hass: HomeAssistant) -> float:
+    return float(hass.states.get(ENERGY).state)
+
+
 async def test_energy_starts_at_zero(
     hass: HomeAssistant, setup_integration: None
 ) -> None:
-    assert float(hass.states.get(ENERGY).state) == 0
+    assert _energy(hass) == 0
 
 
 async def test_energy_integrates_live_power(
-    hass: HomeAssistant, setup_integration: None, freezer: FrozenDateTimeFactory
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_client: AsyncMock,
+    stream: FakeStream,
+    freezer: FrozenDateTimeFactory,
 ) -> None:
-    hass.states.async_set(LIVE_POWER, "7.2")
-    await hass.async_block_till_done()
+    await _set_state(hass, setup_integration, mock_client, "CHARGING")
+    await _push(hass, stream, 7.2)
     freezer.tick(timedelta(seconds=36))  # 0.01 hours
-    hass.states.async_set(LIVE_POWER, "3.0")
-    await hass.async_block_till_done()
+    await _push(hass, stream, 3.0)
 
     # The elapsed window is credited at the *previous* reading's power.
-    assert float(hass.states.get(ENERGY).state) == pytest.approx(0.072)
+    assert _energy(hass) == pytest.approx(0.072)
 
     freezer.tick(timedelta(seconds=36))
-    hass.states.async_set(LIVE_POWER, "0")
-    await hass.async_block_till_done()
+    await _push(hass, stream, None)
 
-    assert float(hass.states.get(ENERGY).state) == pytest.approx(0.072 + 0.03)
+    assert _energy(hass) == pytest.approx(0.072 + 0.03)
 
 
-async def test_energy_ignores_unusable_power_states(
-    hass: HomeAssistant, setup_integration: None, freezer: FrozenDateTimeFactory
+async def test_energy_counts_steady_readings(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_client: AsyncMock,
+    stream: FakeStream,
+    freezer: FrozenDateTimeFactory,
 ) -> None:
-    hass.states.async_set(LIVE_POWER, "5.0")
-    await hass.async_block_till_done()
-    freezer.tick(timedelta(seconds=36))
-    hass.states.async_set(LIVE_POWER, STATE_UNAVAILABLE)
-    await hass.async_block_till_done()
-    credited = float(hass.states.get(ENERGY).state)
-    assert credited == pytest.approx(0.05)
-
-    freezer.tick(timedelta(seconds=36))
-    hass.states.async_set(LIVE_POWER, "9.0")
-    await hass.async_block_till_done()
-
-    # Nothing is credited across a window with no usable previous reading.
-    assert float(hass.states.get(ENERGY).state) == credited
-
-
-async def test_energy_does_not_credit_long_gaps(
-    hass: HomeAssistant, setup_integration: None, freezer: FrozenDateTimeFactory
-) -> None:
-    hass.states.async_set(LIVE_POWER, "7.0")
-    await hass.async_block_till_done()
-    freezer.tick(timedelta(hours=2))
-    hass.states.async_set(LIVE_POWER, "7.1")
-    await hass.async_block_till_done()
-
-    assert float(hass.states.get(ENERGY).state) == 0
-
-
-async def test_energy_integrates_a_steady_reading(
-    hass: HomeAssistant, setup_integration: None, freezer: FrozenDateTimeFactory
-) -> None:
-    """An unchanged reading is still time spent at that power.
-
-    Writing the same state again fires a state reported event rather than a state
-    change, so a steady charge must not be credited as nothing.
-    """
+    """Every reading counts, even one identical to the last."""
+    await _set_state(hass, setup_integration, mock_client, "CHARGING")
     for _ in range(4):
-        hass.states.async_set(LIVE_POWER, "7.2")
-        await hass.async_block_till_done()
-        # Stay within one poll, which would otherwise write the real state.
+        await _push(hass, stream, 7.2)
         freezer.tick(timedelta(seconds=10))
-    hass.states.async_set(LIVE_POWER, "7.2")
+    await _push(hass, stream, 7.2)
+
+    assert _energy(hass) == pytest.approx(0.08)
+
+
+async def test_energy_stops_when_charging_stops_after_the_stream_ended(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_client: AsyncMock,
+    stream: FakeStream,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A stream that ended by itself doesn't leave live power stuck on."""
+    await _set_state(hass, setup_integration, mock_client, "CHARGING")
+    await _push(hass, stream, 7.2)
+    stream.end()
+    await _yield()
+    freezer.tick(timedelta(seconds=36))
+    await _set_state(hass, setup_integration, mock_client, "NOT_CHARGING")
+
+    assert hass.states.get(LIVE_POWER).state == "0"
+    assert _energy(hass) == pytest.approx(0.072)
+
+    # Polls while idle add nothing.
+    for _ in range(10):
+        freezer.tick(timedelta(minutes=1))
+        await _set_state(hass, setup_integration, mock_client, "NOT_CHARGING")
+    assert _energy(hass) == pytest.approx(0.072)
+
+
+async def test_energy_does_not_count_polls_as_readings(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_client: AsyncMock,
+    stream: FakeStream,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Polls re-render live power; a stalled stream mustn't be credited forever."""
+    await _set_state(hass, setup_integration, mock_client, "CHARGING")
+    await _push(hass, stream, 7.0)
+    for _ in range(30):
+        freezer.tick(timedelta(minutes=1))
+        await _set_state(hass, setup_integration, mock_client, "CHARGING")
+    await _push(hass, stream, 7.1)
+
+    # The 30 minute gap between readings is too long to trust.
+    assert _energy(hass) == 0
+
+
+async def test_energy_is_independent_of_the_live_power_display_unit(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_client: AsyncMock,
+    stream: FakeStream,
+    entity_registry: er.EntityRegistry,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    entity_registry.async_update_entity_options(
+        LIVE_POWER, "sensor", {"unit_of_measurement": "W"}
+    )
+    await hass.async_block_till_done()
+    await _set_state(hass, setup_integration, mock_client, "CHARGING")
+    await _push(hass, stream, 7.2)
+    freezer.tick(timedelta(seconds=36))
+    await _push(hass, stream, 7.2)
+
+    assert float(hass.states.get(LIVE_POWER).state) == pytest.approx(7200)
+    assert _energy(hass) == pytest.approx(0.072)
+
+
+async def test_energy_counts_with_live_power_disabled(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_client: AsyncMock,
+    stream: FakeStream,
+    entity_registry: er.EntityRegistry,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    entity_registry.async_get_or_create(
+        "sensor",
+        DOMAIN,
+        f"{DEVICE_UUID}_live_power",
+        suggested_object_id="octopus_charge_live_power",
+        disabled_by=er.RegistryEntryDisabler.USER,
+    )
+    mock_client.async_get_charge_points.return_value = [
+        charge_point(operationalState="CHARGING")
+    ]
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
     await hass.async_block_till_done()
 
-    # 7.2kW for 40 seconds, despite the state never changing.
-    assert float(hass.states.get(ENERGY).state) == pytest.approx(0.08)
+    await _push(hass, stream, 7.2)
+    freezer.tick(timedelta(seconds=36))
+    await _push(hass, stream, 7.2)
+
+    assert hass.states.get(LIVE_POWER) is None
+    assert _energy(hass) == pytest.approx(0.072)
+
+
+async def test_live_power_keeps_streaming_through_a_failed_poll(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_client: AsyncMock,
+    stream: FakeStream,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    await _set_state(hass, setup_integration, mock_client, "CHARGING")
+    await _push(hass, stream, 7.2)
+
+    mock_client.async_get_charge_points.side_effect = OctopusChargeConnectionError
+    await setup_integration.runtime_data.coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert hass.states.get(OPERATIONAL_STATE).state == STATE_UNAVAILABLE
+
+    freezer.tick(timedelta(seconds=36))
+    await _push(hass, stream, 7.0)
+
+    assert hass.states.get(LIVE_POWER).state == "7.0"
+    assert _energy(hass) == pytest.approx(0.072)
 
 
 async def test_energy_total_is_restored(
@@ -453,49 +576,27 @@ async def test_energy_total_is_restored(
     assert hass.states.get(ENERGY).state == "37.25"
 
 
-async def test_unavailable_restored_state_starts_from_zero(
+async def test_total_saved_while_unavailable_is_restored(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
     mock_client: AsyncMock,
 ) -> None:
+    """E.g. reloading after a reauth, or restarting during an outage."""
     mock_restore_cache_with_extra_data(
         hass,
-        [(State(ENERGY, STATE_UNAVAILABLE), {"native_value": 5.0})],
+        [
+            (
+                State(ENERGY, STATE_UNAVAILABLE),
+                {"native_value": 5.0, "native_unit_of_measurement": "kWh"},
+            )
+        ],
     )
     mock_config_entry.add_to_hass(hass)
 
     await hass.config_entries.async_setup(mock_config_entry.entry_id)
     await hass.async_block_till_done()
 
-    assert float(hass.states.get(ENERGY).state) == 0
-
-
-async def test_energy_follows_a_renamed_live_power_entity(
-    hass: HomeAssistant,
-    setup_integration: MockConfigEntry,
-    entity_registry: er.EntityRegistry,
-    freezer: FrozenDateTimeFactory,
-) -> None:
-    hass.states.async_set(LIVE_POWER, "10")
-    await hass.async_block_till_done()
-    freezer.tick(timedelta(seconds=36))
-    hass.states.async_set(LIVE_POWER, "10.1")
-    await hass.async_block_till_done()
-    before = float(hass.states.get(ENERGY).state)
-    assert before > 0
-
-    entity_registry.async_update_entity(LIVE_POWER, new_entity_id="sensor.ev_power")
-    await hass.async_block_till_done()
-    assert setup_integration.state is ConfigEntryState.LOADED
-
-    # The total survives the reload and now follows the renamed entity.
-    assert float(hass.states.get(ENERGY).state) == pytest.approx(before)
-    hass.states.async_set("sensor.ev_power", "8")
-    await hass.async_block_till_done()
-    freezer.tick(timedelta(seconds=36))
-    hass.states.async_set("sensor.ev_power", "8.1")
-    await hass.async_block_till_done()
-    assert float(hass.states.get(ENERGY).state) > before
+    assert _energy(hass) == 5.0
 
 
 async def test_entities_are_unavailable_when_the_charge_point_disappears(

@@ -49,8 +49,10 @@ class OctopusChargeControlModeSelect(OctopusChargeEntity, SelectEntity):
 
     async def async_select_option(self, option: str) -> None:
         """Set the control mode."""
-        await self.coordinator.client.async_set_control_mode(
-            self.coordinator.account_number, self._device_uuid, option
+        await self._async_send(
+            self.coordinator.client.async_set_control_mode(
+                self.coordinator.account_number, self._device_uuid, option
+            )
         )
         self._optimistic.set(option)
         self.async_write_ha_state()

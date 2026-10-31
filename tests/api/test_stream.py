@@ -105,3 +105,45 @@ def test_crlf_line_endings() -> None:
     _, readings = parse_power_stream_chunk("", chunk)
 
     assert readings == [kw(4.4)]
+
+
+def test_crlf_split_across_chunks() -> None:
+    """A chunk ending between the \\r and \\n of a CRLF still parses."""
+    message = (
+        b"--graphql\r\ncontent-type: application/json\r\n\r\n"
+        b'{"payload":{"data":{"electricChargerPowerReadings":'
+        b'{"value":7.2,"unit":"kW"}}}}\r\n--graphql'
+    )
+    split = message.index(b"\r\n\r\n") + 3  # between the last \r and \n
+
+    buffer, first = parse_power_stream_chunk("", message[:split])
+    buffer, second = parse_power_stream_chunk(buffer, message[split:])
+
+    assert first == []
+    assert [reading.value for reading in second] == [7.2]
+
+
+def test_error_parts_are_not_zero_readings() -> None:
+    """An error carries no reading; it mustn't be reported as 0kW."""
+    message = (
+        b"--graphql\r\ncontent-type: application/json\r\n\r\n"
+        b'{"payload":null,"errors":[{"message":"JWT has expired"}]}\r\n'
+        b"--graphql\r\ncontent-type: application/json\r\n\r\n"
+        b'{"payload":{"errors":[{"message":"boom"}]}}\r\n--graphql'
+    )
+
+    _, readings = parse_power_stream_chunk("", message)
+
+    assert readings == []
+
+
+def test_field_errors_with_a_null_reading_are_not_zero_readings() -> None:
+    message = (
+        b"--graphql\r\ncontent-type: application/json\r\n\r\n"
+        b'{"payload":{"data":{"electricChargerPowerReadings":null},'
+        b'"errors":[{"message":"boom"}]}}\r\n--graphql'
+    )
+
+    _, readings = parse_power_stream_chunk("", message)
+
+    assert readings == []
