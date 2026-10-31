@@ -15,7 +15,6 @@ from .coordinator import (
     OctopusChargeRuntimeData,
     OctopusChargeScheduleCoordinator,
 )
-from .migration import async_migrate_from_octopus_energy
 
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
@@ -52,8 +51,6 @@ async def async_setup_entry(
         coordinator=coordinator,
         schedule_coordinator=schedule_coordinator,
     )
-
-    await async_migrate_from_octopus_energy(hass, entry)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True

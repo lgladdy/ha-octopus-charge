@@ -95,8 +95,6 @@ Starting or stopping a boost polls every 10 seconds for a minute, so the state r
 
 The two integrations are independent and can both be set up with the same API key. Octopus Charge creates its own device, so you will no longer see charger entities attached to an Intelligent Octopus Go device.
 
-If you previously used the charge point support from the fork of the Octopus Energy integration, adding Octopus Charge hands those entities over to this integration, keeping their history and your energy total, and renames them to the `octopus_charge` prefix. Update any automations or dashboards that referenced the old IDs. (This one-off migration is temporary and will be removed before the first release.)
-
 ## Troubleshooting
 
 Download diagnostics from the integration's page to see the data returned by Octopus (account and device identifiers are redacted). Enable debug logging with:

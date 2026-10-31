@@ -20,8 +20,7 @@ custom_components/octopus_charge/
 ├── coordinator.py           # Status coordinator (1 min, burst refresh) + schedule coordinator
 ├── entity.py                # Base entity, optimistic values, dynamic entity adding
 ├── sensor.py binary_sensor.py switch.py select.py number.py
-├── diagnostics.py  services.yaml  icons.json  strings.json  translations/en.json
-└── migration.py             # TEMPORARY: takes over the fork's octopus_energy entities
+└── diagnostics.py  services.yaml  icons.json  strings.json  translations/en.json
 ```
 
 Root: `hacs.json`, `.github/workflows/` (lint, tests, hassfest, HACS),
@@ -54,8 +53,3 @@ Uses `pytest-homeassistant-custom-component`. Freeze time (`freezer`) *before*
 setting the integration up - freezing afterwards makes every timer instantly due.
 CI also runs against the minimum supported HA version (see `hacs.json` and the
 `minimum` matrix entry in `.github/workflows/tests.yml`; keep them in step).
-
-## Before tagging 0.1.0
-
-- Delete `migration.py`, its call in `__init__.py`, `tests/test_migration.py`, and
-  the migration note in the README.
