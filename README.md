@@ -4,7 +4,7 @@ A Home Assistant custom integration for the [Octopus Charge](https://octopus.ene
 
 > **Status:** early development. Install from `main` for now; there are no tagged releases yet.
 
-This code started life as charge point support for [BottlecapDave's Octopus Energy integration](https://github.com/BottlecapDave/HomeAssistant-OctopusEnergy), and shares its heritage (and MIT licence) with it. It runs **alongside** that integration, rather than replacing it: keep using it for rates, consumption, Intelligent Octopus Go and so on.
+It runs **alongside** the [Octopus Energy integration](https://github.com/BottlecapDave/HomeAssistant-OctopusEnergy) rather than replacing it: keep using that for rates, consumption, Intelligent Octopus Go and so on.
 
 ## Features
 
@@ -115,9 +115,7 @@ python3.14 -m venv .venv
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 ```
 
-## Credits
-
-Built from the charge point support written for [BottlecapDave's Octopus Energy integration](https://github.com/BottlecapDave/HomeAssistant-OctopusEnergy), originally by David Kendall. Not affiliated with or endorsed by Octopus Energy.
+Not affiliated with or endorsed by Octopus Energy.
 
 ## Licence
 
