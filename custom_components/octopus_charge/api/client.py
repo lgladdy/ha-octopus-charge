@@ -16,8 +16,10 @@ from homeassistant.util import dt as dt_util
 from .exceptions import (
     OctopusChargeAuthError,
     OctopusChargeConnectionError,
+    OctopusChargeError,
     OctopusChargeRequestError,
     OctopusChargeServerError,
+    OctopusChargeUnauthenticatedError,
 )
 from .models import (
     ChargePointDaySchedule,
@@ -332,7 +334,13 @@ class OctopusChargeApiClient:
                     except OctopusChargeAuthError:
                         self._is_api_key_invalid = True
                         raise
-            except OctopusChargeServerError:
+            except OctopusChargeAuthError:
+                raise
+            except OctopusChargeError:
+                # Any other failure (server error, rate limit reported as a
+                # GraphQL error, connection failure...) gets the cooldown, so a
+                # struggling or rate limiting token endpoint isn't hit again on
+                # every request.
                 self._token_retrieval_failures += 1
                 self._token_retrieval_cooldown_until = (
                     dt_util.utcnow()
@@ -422,7 +430,7 @@ class OctopusChargeApiClient:
 
                 # Force re-authentication on the next request.
                 self._reset_tokens()
-                raise OctopusChargeAuthError(
+                raise OctopusChargeUnauthenticatedError(
                     f"Unauthenticated request ({context}): {status}"
                 )
 
@@ -461,10 +469,31 @@ class OctopusChargeApiClient:
     async def _async_graphql(
         self, query: str, context: str, url: str = BACKEND_GRAPHQL_URL
     ) -> dict[str, Any]:
-        """Run an authenticated GraphQL operation."""
-        token = await self._async_ensure_token()
-        body = await self._async_post(url, {"query": query}, context, token)
-        return (body or {}).get("data") or {}
+        """Run an authenticated GraphQL operation.
+
+        If the token is rejected, retry once with a new one retrieved using the
+        API key. Only a failure to retrieve that token means the API key itself
+        is bad; a fresh token being rejected too is something re-entering the key
+        won't fix, so it's reported as a request error rather than an auth error.
+        """
+        for attempt in range(2):
+            token = await self._async_ensure_token()
+            try:
+                body = await self._async_post(url, {"query": query}, context, token)
+            except OctopusChargeUnauthenticatedError as err:
+                if attempt == 0:
+                    _LOGGER.debug(
+                        "Token rejected (%s) - retrying with a new one", context
+                    )
+                    continue
+
+                raise OctopusChargeRequestError(
+                    f"Request rejected with a newly retrieved token ({context})"
+                ) from err
+
+            return (body or {}).get("data") or {}
+
+        raise AssertionError("unreachable")  # pragma: no cover
 
     # ------------------------------------------------------------------
     # Account / discovery

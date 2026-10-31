@@ -225,6 +225,37 @@ async def test_token_server_errors_trigger_a_cooldown(
     assert aioclient_mock.call_count == 2
 
 
+@pytest.mark.parametrize(
+    "response",
+    [
+        # Kraken reports some failures, rate limiting included, as GraphQL errors.
+        {"json": {"errors": [{"message": "Too many requests."}]}},
+        {"status": 400, "text": "bad request"},
+        {"exc": aiohttp.ClientError()},
+    ],
+    ids=["graphql-error", "http-400", "connection-error"],
+)
+async def test_other_token_failures_trigger_a_cooldown(
+    client: OctopusChargeApiClient,
+    aioclient_mock: AiohttpClientMocker,
+    freezer: FrozenDateTimeFactory,
+    response: dict[str, Any],
+) -> None:
+    aioclient_mock.post(KRAKEN_GRAPHQL_URL, **response)
+
+    with pytest.raises(
+        (OctopusChargeRequestError, OctopusChargeConnectionError)
+    ) as exc_info:
+        await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
+    assert not isinstance(exc_info.value, OctopusChargeAuthError)
+    assert aioclient_mock.call_count == 1
+
+    # Within the cooldown no further token request is made.
+    with pytest.raises(OctopusChargeServerError):
+        await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
+    assert aioclient_mock.call_count == 1
+
+
 async def test_cooldown_lengthens_with_repeated_failures(
     client: OctopusChargeApiClient,
     aioclient_mock: AiohttpClientMocker,
@@ -288,19 +319,40 @@ async def test_cloudfront_403_is_a_server_error(
         await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
 
 
-async def test_unauthorised_response_forces_a_new_token(
+async def test_rejected_token_is_retried_with_a_new_one(
+    client: OctopusChargeApiClient, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """A 401 on a data request retries once with a new token, not a reauth."""
+    aioclient_mock.post(KRAKEN_GRAPHQL_URL, json=token_response())
+    responses = iter(
+        [
+            AiohttpClientMockResponse("POST", BACKEND_GRAPHQL_URL, status=401),
+            AiohttpClientMockResponse("POST", BACKEND_GRAPHQL_URL, json={"data": {}}),
+        ]
+    )
+
+    async def _respond(*_: Any) -> AiohttpClientMockResponse:
+        return next(responses)
+
+    aioclient_mock.post(BACKEND_GRAPHQL_URL, side_effect=_respond)
+
+    assert await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID) == []
+    # The rejected token was thrown away and a new one retrieved with the key.
+    assert len(calls_to(aioclient_mock, KRAKEN_GRAPHQL_URL)) == 2
+    assert len(calls_to(aioclient_mock, BACKEND_GRAPHQL_URL)) == 2
+
+
+async def test_fresh_token_rejected_too_is_not_an_auth_error(
     client: OctopusChargeApiClient, token_mock: AiohttpClientMocker
 ) -> None:
+    """If even a brand new token is refused, re-entering the key won't help."""
     token_mock.post(BACKEND_GRAPHQL_URL, status=401, text="nope")
-    with pytest.raises(OctopusChargeAuthError):
+
+    with pytest.raises(OctopusChargeRequestError) as exc_info:
         await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
 
-    token_mock.clear_requests()
-    token_mock.post(KRAKEN_GRAPHQL_URL, json=token_response())
-    token_mock.post(BACKEND_GRAPHQL_URL, json={"data": {}})
-    await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
-
-    assert len(calls_to(token_mock, KRAKEN_GRAPHQL_URL)) == 1
+    assert not isinstance(exc_info.value, OctopusChargeAuthError)
+    assert len(calls_to(token_mock, BACKEND_GRAPHQL_URL)) == 2
 
 
 async def test_graphql_errors_are_request_errors(

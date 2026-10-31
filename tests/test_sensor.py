@@ -358,7 +358,7 @@ async def test_unloading_stops_the_stream(
 async def test_energy_starts_at_zero(
     hass: HomeAssistant, setup_integration: None
 ) -> None:
-    assert hass.states.get(ENERGY).state == "0"
+    assert float(hass.states.get(ENERGY).state) == 0
 
 
 async def test_energy_integrates_live_power(
@@ -408,7 +408,27 @@ async def test_energy_does_not_credit_long_gaps(
     hass.states.async_set(LIVE_POWER, "7.1")
     await hass.async_block_till_done()
 
-    assert hass.states.get(ENERGY).state == "0"
+    assert float(hass.states.get(ENERGY).state) == 0
+
+
+async def test_energy_integrates_a_steady_reading(
+    hass: HomeAssistant, setup_integration: None, freezer: FrozenDateTimeFactory
+) -> None:
+    """An unchanged reading is still time spent at that power.
+
+    Writing the same state again fires a state reported event rather than a state
+    change, so a steady charge must not be credited as nothing.
+    """
+    for _ in range(4):
+        hass.states.async_set(LIVE_POWER, "7.2")
+        await hass.async_block_till_done()
+        # Stay within one poll, which would otherwise write the real state.
+        freezer.tick(timedelta(seconds=10))
+    hass.states.async_set(LIVE_POWER, "7.2")
+    await hass.async_block_till_done()
+
+    # 7.2kW for 40 seconds, despite the state never changing.
+    assert float(hass.states.get(ENERGY).state) == pytest.approx(0.08)
 
 
 async def test_energy_total_is_restored(
@@ -447,7 +467,7 @@ async def test_unavailable_restored_state_starts_from_zero(
     await hass.config_entries.async_setup(mock_config_entry.entry_id)
     await hass.async_block_till_done()
 
-    assert hass.states.get(ENERGY).state == "0"
+    assert float(hass.states.get(ENERGY).state) == 0
 
 
 async def test_energy_follows_a_renamed_live_power_entity(

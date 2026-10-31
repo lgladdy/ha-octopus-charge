@@ -26,3 +26,11 @@ class OctopusChargeRequestError(OctopusChargeError):
 
 class OctopusChargeAuthError(OctopusChargeRequestError):
     """The API key was rejected."""
+
+
+class OctopusChargeUnauthenticatedError(OctopusChargeAuthError):
+    """Octopus rejected the request's credentials with an HTTP 401/403.
+
+    On a data request this usually means the token was rejected rather than the
+    API key, so the client retries once with a freshly retrieved token.
+    """
