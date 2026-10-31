@@ -25,4 +25,4 @@ def integrate_energy_kwh(
     if elapsed_hours <= 0 or elapsed_hours >= max_step_hours:
         return current_total_kwh
 
-    return round(current_total_kwh + (power_kw * elapsed_hours), 4)
+    return current_total_kwh + (power_kw * elapsed_hours)

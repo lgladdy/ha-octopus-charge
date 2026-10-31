@@ -13,7 +13,7 @@ def test_constant_power_accumulates() -> None:
 
     result = integrate_energy_kwh(10.0, 7.0, elapsed_hours)
 
-    assert result == round(10.0 + (7.0 * elapsed_hours), 4)
+    assert result == pytest.approx(10.0 + (7.0 * elapsed_hours))
 
 
 def test_many_short_steps_accumulate_correctly() -> None:
@@ -24,6 +24,19 @@ def test_many_short_steps_accumulate_correctly() -> None:
         total = integrate_energy_kwh(total, 7.0, elapsed_hours)
 
     assert total == pytest.approx(13.5, abs=0.01)
+
+
+def test_small_steps_do_not_lose_energy_to_rounding() -> None:
+    """Frequent small steps add up exactly rather than drifting.
+
+    0.5kW for one second is ~0.000139kWh; rounding each step to 4 places would
+    drop over a quarter of it.
+    """
+    total = 0.0
+    for _ in range(3600):
+        total = integrate_energy_kwh(total, 0.5, 1 / 3600)
+
+    assert total == pytest.approx(0.5)
 
 
 @pytest.mark.parametrize("elapsed_hours", [0, -0.1])
@@ -41,7 +54,7 @@ def test_gap_just_under_max_step_is_counted() -> None:
     """A gap inside the limit is still integrated."""
     result = integrate_energy_kwh(10.0, 7.0, 0.099, max_step_hours=0.1)
 
-    assert result == round(10.0 + (7.0 * 0.099), 4)
+    assert result == pytest.approx(10.0 + (7.0 * 0.099))
 
 
 def test_zero_power_leaves_total_unchanged() -> None:

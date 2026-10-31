@@ -29,6 +29,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import (
     async_track_entity_registry_updated_event,
     async_track_state_change_event,
+    async_track_state_report_event,
 )
 from homeassistant.util import dt as dt_util
 
@@ -315,7 +316,9 @@ class OctopusChargeEnergySensor(OctopusChargeEntity, RestoreSensor):
         self._unsub_registry_wait: Callable[[], None] | None = None
         self._last_reading_at: datetime | None = None
         self._last_power_kw: float | None = None
-        self._attr_native_value = None
+        # Accumulated at full precision; the state is rounded for display only,
+        # so rounding error doesn't build up over many small integration steps.
+        self._total_kwh: float | None = None
 
     async def async_added_to_hass(self) -> None:
         """Restore the running total and start tracking live power."""
@@ -328,10 +331,14 @@ class OctopusChargeEnergySensor(OctopusChargeEntity, RestoreSensor):
             and last_sensor_data is not None
             and last_state.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
         ):
-            self._attr_native_value = last_sensor_data.native_value
+            try:
+                self._total_kwh = float(last_sensor_data.native_value)  # type: ignore[arg-type]
+            except TypeError, ValueError:
+                self._total_kwh = None
 
-        if self._attr_native_value is None:
-            self._attr_native_value = 0
+        if self._total_kwh is None:
+            self._total_kwh = 0.0
+        self._attr_native_value = round(self._total_kwh, 4)
 
         self._async_start_tracking()
 
@@ -384,6 +391,15 @@ class OctopusChargeEnergySensor(OctopusChargeEntity, RestoreSensor):
                 self.hass, [entity_id], self._async_update_from_power
             )
         )
+        # A reading identical to the previous one doesn't change the state, so
+        # Home Assistant reports it rather than firing a state change. Those
+        # still mark time passing at that power, so they must be integrated too
+        # or a steady charge would be credited as nothing.
+        self.async_on_remove(
+            async_track_state_report_event(
+                self.hass, [entity_id], self._async_update_from_power
+            )
+        )
         # If the user renames the live power entity while running, the entity id
         # we resolved goes stale - reload to pick up the new one.
         self.async_on_remove(
@@ -429,12 +445,13 @@ class OctopusChargeEnergySensor(OctopusChargeEntity, RestoreSensor):
         if (
             self._last_reading_at is not None
             and self._last_power_kw is not None
-            and self._attr_native_value is not None
+            and self._total_kwh is not None
         ):
             elapsed_hours = (now - self._last_reading_at).total_seconds() / 3600
-            self._attr_native_value = integrate_energy_kwh(
-                self._attr_native_value, self._last_power_kw, elapsed_hours
+            self._total_kwh = integrate_energy_kwh(
+                self._total_kwh, self._last_power_kw, elapsed_hours
             )
+            self._attr_native_value = round(self._total_kwh, 4)
             self.async_write_ha_state()
 
         self._last_reading_at = now
