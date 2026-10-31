@@ -31,8 +31,9 @@ def parse_power_stream_chunk(
     readings: list[ChargePointPowerReading | None] = []
 
     # Normalise CRLF up front so the boundary/header-body parsing below only
-    # ever has to deal with plain \n.
-    buffer += chunk.decode("utf-8", errors="ignore").replace("\r\n", "\n")
+    # ever has to deal with plain \n. Done on the joined buffer, not the chunk,
+    # because a chunk can end between the \r and the \n.
+    buffer = (buffer + chunk.decode("utf-8", errors="ignore")).replace("\r\n", "\n")
 
     # Buffer across reads and only treat a segment as complete once a boundary
     # after it has arrived.

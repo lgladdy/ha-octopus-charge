@@ -67,3 +67,27 @@ def test_unparseable_times_are_skipped() -> None:
     assert compute_next_schedule_transition(schedule, MONDAY_10AM) == datetime(
         2026, 8, 31, 19, 0
     )
+
+
+def test_period_crossing_midnight_ends_the_next_day() -> None:
+    schedule = {"MONDAY": [{"start": "23:00", "end": "06:00", "action": "ON"}]}
+
+    result = compute_next_schedule_transition(schedule, datetime(2026, 8, 31, 23, 30))
+
+    assert result == datetime(2026, 9, 1, 6, 0)
+
+
+def test_period_ending_at_midnight_ends_the_next_day() -> None:
+    schedule = {"MONDAY": [{"start": "18:00", "end": "00:00", "action": "ON"}]}
+
+    result = compute_next_schedule_transition(schedule, datetime(2026, 8, 31, 19, 0))
+
+    assert result == datetime(2026, 9, 1, 0, 0)
+
+
+def test_yesterdays_overnight_period_ends_this_morning() -> None:
+    schedule = {"MONDAY": [{"start": "23:00", "end": "06:00", "action": "ON"}]}
+
+    result = compute_next_schedule_transition(schedule, datetime(2026, 9, 1, 2, 0))
+
+    assert result == datetime(2026, 9, 1, 6, 0)

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -17,20 +18,11 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.const import (
-    STATE_UNAVAILABLE,
-    STATE_UNKNOWN,
-    Platform,
     UnitOfEnergy,
     UnitOfPower,
 )
-from homeassistant.core import Event, HomeAssistant, callback
-from homeassistant.helpers import entity_registry as er
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
-from homeassistant.helpers.event import (
-    async_track_entity_registry_updated_event,
-    async_track_state_change_event,
-    async_track_state_report_event,
-)
 from homeassistant.util import dt as dt_util
 
 from .api.exceptions import OctopusChargeError
@@ -87,18 +79,21 @@ async def async_setup_entry(
     """Set up the sensors."""
     coordinator = entry.runtime_data.coordinator
 
+    monitors: dict[str, OctopusChargePowerMonitor] = {}
+
     def _factory(device_uuid: str) -> list[SensorEntity]:
-        live_power = OctopusChargeLivePowerSensor(coordinator, device_uuid)
+        if (monitor := monitors.get(device_uuid)) is None:
+            monitor = monitors[device_uuid] = OctopusChargePowerMonitor(
+                coordinator, device_uuid
+            )
         return [
             *(
                 OctopusChargeEnumSensor(coordinator, device_uuid, description)
                 for description in ENUM_SENSORS
             ),
             OctopusChargeBoostEndTimeSensor(coordinator, device_uuid),
-            live_power,
-            OctopusChargeEnergySensor(
-                coordinator, device_uuid, live_power.unique_id or ""
-            ),
+            OctopusChargeLivePowerSensor(coordinator, device_uuid, monitor),
+            OctopusChargeEnergySensor(coordinator, device_uuid, monitor),
             OctopusChargeScheduleSensor(
                 coordinator, entry.runtime_data.schedule_coordinator, device_uuid
             ),
@@ -127,6 +122,10 @@ class OctopusChargeEnumSensor(OctopusChargeEntity, SensorEntity):
         super().__init__(coordinator, device_uuid, description.key)
         self.entity_description = description
         self._unrecognized_value: str | None = None
+
+    async def async_added_to_hass(self) -> None:
+        """Take the current value once added (not on construction)."""
+        await super().async_added_to_hass()
         self._update_value()
 
     def _update_value(self) -> None:
@@ -173,96 +172,118 @@ class OctopusChargeBoostEndTimeSensor(OctopusChargeEntity, SensorEntity):
             return None
 
         try:
-            return datetime.fromisoformat(charge_point.boostEndTime)
+            end = dt_util.parse_datetime(charge_point.boostEndTime)
         except ValueError:
             return None
+        if end is None:
+            return None
+        # A timestamp sensor needs an aware value; Kraken works in UTC.
+        return end if end.tzinfo is not None else end.replace(tzinfo=UTC)
 
 
-class OctopusChargeLivePowerSensor(OctopusChargeEntity, SensorEntity):
-    """The charger's instantaneous power draw.
+class OctopusChargePowerMonitor:
+    """Streams one charge point's live power while it is charging.
 
-    Unlike every other entity this is push driven rather than polled: it opens a
-    live connection to Octopus and streams readings as they arrive, only while the
-    charger is actually charging. Deliberately not restored - a stale "last known
-    kW" surviving a restart would be misleading for something this transient.
+    Unlike everything else this is push driven rather than polled: it holds a
+    live connection to Octopus open while the charger is charging, and tells its
+    listeners about each reading as it arrives. Both the live power and energy
+    sensors listen, so energy is integrated from the readings themselves - not
+    from the live power entity's state, which is also re-written on every poll
+    and is shown in whatever unit the user picks - and keeps counting even if
+    the live power entity is disabled.
     """
 
-    _attr_device_class = SensorDeviceClass.POWER
-    _attr_native_unit_of_measurement = UnitOfPower.KILO_WATT
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    # Not charging genuinely means no power is being drawn - a real, known
-    # value rather than an absence of data.
-    _attr_native_value = 0
-
     def __init__(self, coordinator: OctopusChargeCoordinator, device_uuid: str) -> None:
-        """Initialise the sensor."""
-        super().__init__(coordinator, device_uuid, "live_power")
+        """Initialise the monitor."""
+        self._coordinator = coordinator
+        self._device_uuid = device_uuid
+        # Not charging genuinely means no power is being drawn - a real, known
+        # value rather than an absence of data.
+        self.power_kw: float = 0
+        self._listeners: list[Callable[[], None]] = []
+        self._unsub_coordinator: Callable[[], None] | None = None
         self._stream_task: asyncio.Task[None] | None = None
 
-    async def async_added_to_hass(self) -> None:
-        """Start streaming straight away if the charger is already charging."""
-        await super().async_added_to_hass()
-        self._async_sync_stream()
+    @callback
+    def async_add_listener(
+        self, update_callback: Callable[[], None]
+    ) -> Callable[[], None]:
+        """Listen for power changes; streams while anything is listening."""
+        self._listeners.append(update_callback)
+        if self._unsub_coordinator is None:
+            self._unsub_coordinator = self._coordinator.async_add_listener(
+                self._async_sync_stream
+            )
+            self._async_sync_stream()
 
-    async def async_will_remove_from_hass(self) -> None:
-        """Stop streaming."""
-        self._async_stop_stream()
-        await super().async_will_remove_from_hass()
+        @callback
+        def _remove() -> None:
+            self._listeners.remove(update_callback)
+            if not self._listeners and self._unsub_coordinator is not None:
+                self._unsub_coordinator()
+                self._unsub_coordinator = None
+                self._async_stop_stream()
+
+        return _remove
 
     @callback
-    def _handle_coordinator_update(self) -> None:
-        self._async_sync_stream()
-        super()._handle_coordinator_update()
+    def _async_set_power(self, power_kw: float) -> None:
+        self.power_kw = power_kw
+        for update_callback in list(self._listeners):
+            update_callback()
 
     @callback
     def _async_sync_stream(self) -> None:
         """Start/stop the stream to match the charger's operational state."""
-        charge_point = self.charge_point
-        is_charging = (
-            charge_point is not None
-            and charge_point.operationalState in CHARGING_STATES
-        )
-        is_streaming = self._stream_task is not None and not self._stream_task.done()
-
-        if is_charging and not is_streaming:
-            _LOGGER.debug("Starting live power stream for %s", self._device_uuid)
-            self._stream_task = (
-                self.coordinator.config_entry.async_create_background_task(
-                    self.hass, self._async_stream_power(), name=f"{DOMAIN} live power"
+        charge_point = self._coordinator.data.get(self._device_uuid)
+        if charge_point is not None and charge_point.operationalState in (
+            CHARGING_STATES
+        ):
+            if self._stream_task is None or self._stream_task.done():
+                _LOGGER.debug("Starting live power stream for %s", self._device_uuid)
+                self._stream_task = (
+                    self._coordinator.config_entry.async_create_background_task(
+                        self._coordinator.hass,
+                        self._async_stream_power(),
+                        name=f"{DOMAIN} live power",
+                    )
                 )
-            )
-        elif not is_charging and is_streaming:
-            _LOGGER.debug(
-                "Stopping live power stream for %s - no longer charging",
-                self._device_uuid,
-            )
-            self._async_stop_stream()
-            self._attr_native_value = 0
+            return
+
+        # Not charging: no power is being drawn, whatever the last reading was
+        # and whether or not a stream is still open.
+        self._async_stop_stream()
+        if self.power_kw != 0:
+            self._async_set_power(0)
 
     @callback
     def _async_stop_stream(self) -> None:
         if self._stream_task is not None and not self._stream_task.done():
+            _LOGGER.debug("Stopping live power stream for %s", self._device_uuid)
             self._stream_task.cancel()
         self._stream_task = None
 
     async def _async_stream_power(self) -> None:
-        """Consume the stream, reconnecting with backoff while it keeps dropping."""
+        """Consume the stream, reconnecting with backoff while still charging.
+
+        Runs until cancelled: the coordinator stops it once the charger is no
+        longer charging, including after the stream has ended by itself.
+        """
         delay = STREAM_INITIAL_RECONNECT_DELAY_SECONDS
         while True:
             try:
-                async for reading in self.coordinator.client.async_stream_power(
-                    self.coordinator.account_number, self._device_uuid
+                async for reading in self._coordinator.client.async_stream_power(
+                    self._coordinator.account_number, self._device_uuid
                 ):
                     delay = STREAM_INITIAL_RECONNECT_DELAY_SECONDS
                     # No reading (e.g. charging just stopped) means 0kW.
-                    self._attr_native_value = reading.value if reading else 0
-                    self.async_write_ha_state()
+                    self._async_set_power(reading.value if reading else 0)
 
-                # Stream ended cleanly. If the charger is still charging the next
-                # coordinator update starts a new one.
-                return
-            except asyncio.CancelledError:
-                raise
+                _LOGGER.debug(
+                    "Live power stream for %s ended. Reconnecting in %ss",
+                    self._device_uuid,
+                    delay,
+                )
             except OctopusChargeError as err:
                 _LOGGER.debug(
                     "Live power stream for %s dropped: %s. Reconnecting in %ss",
@@ -281,14 +302,53 @@ class OctopusChargeLivePowerSensor(OctopusChargeEntity, SensorEntity):
             delay = min(delay * 2, STREAM_MAX_RECONNECT_DELAY_SECONDS)
 
 
+class OctopusChargeLivePowerSensor(OctopusChargeEntity, SensorEntity):
+    """The charger's instantaneous power draw, 0 when not charging.
+
+    Deliberately not restored - a stale "last known kW" surviving a restart would
+    be misleading for something this transient.
+    """
+
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_native_unit_of_measurement = UnitOfPower.KILO_WATT
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(
+        self,
+        coordinator: OctopusChargeCoordinator,
+        device_uuid: str,
+        monitor: OctopusChargePowerMonitor,
+    ) -> None:
+        """Initialise the sensor."""
+        super().__init__(coordinator, device_uuid, "live_power")
+        self._monitor = monitor
+
+    async def async_added_to_hass(self) -> None:
+        """Follow the live power monitor."""
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            self._monitor.async_add_listener(self.async_write_ha_state)
+        )
+
+    @property
+    def available(self) -> bool:
+        """Push driven, so a failed status poll doesn't make readings unavailable."""
+        return self.charge_point is not None
+
+    @property
+    def native_value(self) -> float:
+        """Return the latest power reading."""
+        return self._monitor.power_kw
+
+
 class OctopusChargeEnergySensor(OctopusChargeEntity, RestoreSensor):
     """The charger's cumulative energy use, for the Energy dashboard.
 
     Octopus's API doesn't expose a live cumulative energy counter for the charger
     - only a per-session total once a session has fully ended - so this integrates
-    the live power sensor's readings over time instead, the same Riemann-sum
-    approach Home Assistant's built-in "Integration - Riemann sum integral" helper
-    uses, just built in.
+    the live power readings over time instead, the same Riemann-sum approach Home
+    Assistant's built-in "Integration - Riemann sum integral" helper uses, just
+    built in.
 
     Starts from 0 when first added - there's no way to know the charger's actual
     lifetime total from the API.
@@ -307,146 +367,50 @@ class OctopusChargeEnergySensor(OctopusChargeEntity, RestoreSensor):
         self,
         coordinator: OctopusChargeCoordinator,
         device_uuid: str,
-        live_power_unique_id: str,
+        monitor: OctopusChargePowerMonitor,
     ) -> None:
         """Initialise the sensor."""
         super().__init__(coordinator, device_uuid, "energy")
-        self._live_power_unique_id = live_power_unique_id
-        self._live_power_entity_id: str | None = None
-        self._unsub_registry_wait: Callable[[], None] | None = None
-        self._last_reading_at: datetime | None = None
-        self._last_power_kw: float | None = None
+        self._monitor = monitor
         # Accumulated at full precision; the state is rounded for display only,
         # so rounding error doesn't build up over many small integration steps.
-        self._total_kwh: float | None = None
+        self._total_kwh = 0.0
+        self._last_reading_at: datetime | None = None
+        self._last_power_kw: float | None = None
 
     async def async_added_to_hass(self) -> None:
-        """Restore the running total and start tracking live power."""
+        """Restore the running total and start integrating live power."""
         await super().async_added_to_hass()
 
-        last_sensor_data = await self.async_get_last_sensor_data()
-        last_state = await self.async_get_last_state()
-        if (
-            last_state is not None
-            and last_sensor_data is not None
-            and last_state.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
-        ):
-            try:
+        # The saved total is valid whatever the entity's last state was - it is
+        # only "unavailable" because the charger data was, e.g. during an outage
+        # or a reauth.
+        if (last_sensor_data := await self.async_get_last_sensor_data()) is not None:
+            with contextlib.suppress(TypeError, ValueError):
                 self._total_kwh = float(last_sensor_data.native_value)  # type: ignore[arg-type]
-            except TypeError, ValueError:
-                self._total_kwh = None
-
-        if self._total_kwh is None:
-            self._total_kwh = 0.0
         self._attr_native_value = round(self._total_kwh, 4)
 
-        self._async_start_tracking()
-
-    @callback
-    def _async_start_tracking(self) -> None:
-        """Track the live power sensor, resolving it via the entity registry.
-
-        Resolved by unique id so this stays correct if the user renames the live
-        power entity.
-        """
-        registry = er.async_get(self.hass)
-        entity_id = registry.async_get_entity_id(
-            Platform.SENSOR, DOMAIN, self._live_power_unique_id
-        )
-        if entity_id is not None:
-            self._async_track(entity_id)
-            return
-
-        # On a brand new install live power is added alongside us and may not be
-        # in the registry yet - wait for it to appear.
-        @callback
-        def _registry_updated(event: Event[Any]) -> None:
-            if event.data.get("action") != "create":
-                return
-
-            if (
-                found := registry.async_get_entity_id(
-                    Platform.SENSOR, DOMAIN, self._live_power_unique_id
-                )
-            ) is not None:
-                self._async_cancel_registry_wait()
-                self._async_track(found)
-
-        self._unsub_registry_wait = self.hass.bus.async_listen(
-            er.EVENT_ENTITY_REGISTRY_UPDATED, _registry_updated
-        )
-        self.async_on_remove(self._async_cancel_registry_wait)
-
-    @callback
-    def _async_cancel_registry_wait(self) -> None:
-        if self._unsub_registry_wait is not None:
-            self._unsub_registry_wait()
-            self._unsub_registry_wait = None
-
-    @callback
-    def _async_track(self, entity_id: str) -> None:
-        self._live_power_entity_id = entity_id
+        self._last_reading_at = dt_util.utcnow()
+        self._last_power_kw = self._monitor.power_kw
         self.async_on_remove(
-            async_track_state_change_event(
-                self.hass, [entity_id], self._async_update_from_power
-            )
+            self._monitor.async_add_listener(self._async_update_from_power)
         )
-        # A reading identical to the previous one doesn't change the state, so
-        # Home Assistant reports it rather than firing a state change. Those
-        # still mark time passing at that power, so they must be integrated too
-        # or a steady charge would be credited as nothing.
-        self.async_on_remove(
-            async_track_state_report_event(
-                self.hass, [entity_id], self._async_update_from_power
-            )
-        )
-        # If the user renames the live power entity while running, the entity id
-        # we resolved goes stale - reload to pick up the new one.
-        self.async_on_remove(
-            async_track_entity_registry_updated_event(
-                self.hass, [entity_id], self._async_live_power_registry_updated
-            )
-        )
+
+    @property
+    def available(self) -> bool:
+        """Calculated locally, so a failed status poll doesn't hide the total."""
+        return self.charge_point is not None
 
     @callback
-    def _async_live_power_registry_updated(self, event: Event[Any]) -> None:
-        data = event.data
-        if data["action"] != "update" or "entity_id" not in data["changes"]:
-            return
-
-        _LOGGER.debug(
-            "Live power entity renamed from '%s' to '%s' - reloading",
-            self._live_power_entity_id,
-            data["entity_id"],
-        )
-        self.hass.config_entries.async_schedule_reload(
-            self.coordinator.config_entry.entry_id
-        )
-
-    @callback
-    def _async_update_from_power(self, event: Event[Any]) -> None:
-        """Integrate the live power sensor's latest reading into the total."""
-        new_state = event.data.get("new_state")
-        power_kw: float | None
-        if new_state is None or new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
-            power_kw = None
-        else:
-            try:
-                power_kw = float(new_state.state)
-            except TypeError, ValueError:
-                power_kw = None
-
+    def _async_update_from_power(self) -> None:
+        """Integrate the window since the previous reading into the total."""
         now = dt_util.utcnow()
         # Integrate using the *previous* reading's power over the window that has
         # just elapsed - that's what was actually being drawn during it. Using the
         # new value instead would integrate the step where charging stops (power
         # drops to 0) as elapsed_time * 0, discarding real energy that was
         # consumed right up until that reading.
-        if (
-            self._last_reading_at is not None
-            and self._last_power_kw is not None
-            and self._total_kwh is not None
-        ):
+        if self._last_reading_at is not None and self._last_power_kw is not None:
             elapsed_hours = (now - self._last_reading_at).total_seconds() / 3600
             self._total_kwh = integrate_energy_kwh(
                 self._total_kwh, self._last_power_kw, elapsed_hours
@@ -455,7 +419,7 @@ class OctopusChargeEnergySensor(OctopusChargeEntity, RestoreSensor):
             self.async_write_ha_state()
 
         self._last_reading_at = now
-        self._last_power_kw = power_kw
+        self._last_power_kw = self._monitor.power_kw
 
 
 class OctopusChargeScheduleSensor(OctopusChargeEntity, SensorEntity):

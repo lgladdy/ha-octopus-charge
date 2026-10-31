@@ -105,3 +105,19 @@ def test_crlf_line_endings() -> None:
     _, readings = parse_power_stream_chunk("", chunk)
 
     assert readings == [kw(4.4)]
+
+
+def test_crlf_split_across_chunks() -> None:
+    """A chunk ending between the \\r and \\n of a CRLF still parses."""
+    message = (
+        b"--graphql\r\ncontent-type: application/json\r\n\r\n"
+        b'{"payload":{"data":{"electricChargerPowerReadings":'
+        b'{"value":7.2,"unit":"kW"}}}}\r\n--graphql'
+    )
+    split = message.index(b"\r\n\r\n") + 3  # between the last \r and \n
+
+    buffer, first = parse_power_stream_chunk("", message[:split])
+    buffer, second = parse_power_stream_chunk(buffer, message[split:])
+
+    assert first == []
+    assert [reading.value for reading in second] == [7.2]

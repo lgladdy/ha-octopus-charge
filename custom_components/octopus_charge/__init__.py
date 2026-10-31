@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from homeassistant.const import CONF_API_KEY, Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.loader import async_get_loaded_integration
 
@@ -23,6 +23,11 @@ PLATFORMS: list[Platform] = [
     Platform.SENSOR,
     Platform.SWITCH,
 ]
+
+
+@callback
+def _keep_polling() -> None:
+    """Listener that keeps the schedule coordinator polling."""
 
 
 async def async_setup_entry(
@@ -45,6 +50,10 @@ async def async_setup_entry(
         hass, entry, client, coordinator
     )
     await schedule_coordinator.async_refresh()
+    # A coordinator only polls while something listens to it, and the schedule
+    # also drives the schedule boundary bursts - keep it polling even if the
+    # Schedule sensor (its only entity) is disabled.
+    entry.async_on_unload(schedule_coordinator.async_add_listener(_keep_polling))
 
     entry.runtime_data = OctopusChargeRuntimeData(
         client=client,

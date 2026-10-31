@@ -18,13 +18,21 @@ from homeassistant.const import (
     STATE_UNKNOWN,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import (
+    HomeAssistantError,
+    ServiceNotSupported,
+    ServiceValidationError,
+)
+from homeassistant.helpers import device_registry as dr
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.octopus_charge.api.exceptions import OctopusChargeServerError
+from custom_components.octopus_charge.api.exceptions import (
+    OctopusChargeAuthError,
+    OctopusChargeServerError,
+)
 from custom_components.octopus_charge.api.models import OnboardedChargePoint
-from custom_components.octopus_charge.const import DOMAIN
+from custom_components.octopus_charge.const import DOMAIN, OPTIMISTIC_TIMEOUT
 from custom_components.octopus_charge.coordinator import OctopusChargeCoordinator
 
 from .conftest import (
@@ -106,6 +114,23 @@ async def test_cable_lock_only_exists_when_supported(
     assert hass.states.get(ECO_MODE) is not None
 
 
+async def test_cable_lock_appears_once_supported(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry, mock_client: AsyncMock
+) -> None:
+    """The configuration can come back empty at first (e.g. charger offline)."""
+    mock_client.async_get_charge_points.return_value = [
+        OnboardedChargePoint.model_validate(charge_point_data(configuration=None))
+    ]
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert hass.states.get(CABLE_LOCK) is None
+
+    await update_charge_point(hass, mock_config_entry, mock_client)
+
+    assert hass.states.get(CABLE_LOCK).state == STATE_OFF
+
+
 @pytest.mark.parametrize(
     ("entity_id", "method", "service", "expected"),
     [
@@ -132,7 +157,7 @@ async def test_setting_switches_send_the_change(
     assert hass.states.get(entity_id).state == (STATE_ON if expected else STATE_OFF)
 
 
-async def test_a_command_is_trusted_until_newer_data_arrives(
+async def test_a_command_is_trusted_until_octopus_reflects_it(
     hass: HomeAssistant,
     setup_integration: MockConfigEntry,
     mock_client: AsyncMock,
@@ -140,16 +165,36 @@ async def test_a_command_is_trusted_until_newer_data_arrives(
 ) -> None:
     await _switch(hass, SERVICE_TURN_OFF, ECO_MODE)
 
-    # A poll that still shows the old value (Octopus is slow to reflect the
-    # change) doesn't flip the switch back...
-    coordinator = setup_integration.runtime_data.coordinator
-    coordinator.last_retrieved = dt_util.utcnow() - timedelta(seconds=30)
-    coordinator.async_update_listeners()
+    # Polls that still show the old value - Octopus being slow to reflect the
+    # change, or a poll already in flight when the command was sent - don't
+    # flip the switch back...
+    freezer.tick(timedelta(seconds=30))
+    await update_charge_point(hass, setup_integration, mock_client)
     assert hass.states.get(ECO_MODE).state == STATE_OFF
 
-    # ...but once newer data has been retrieved it wins.
-    freezer.tick(timedelta(seconds=1))
+    # ...once Octopus reports the new value it is trusted from then on...
+    config = {**charge_point_data()["configuration"], "isEcoModeEnabled": False}
+    await update_charge_point(
+        hass, setup_integration, mock_client, configuration=config
+    )
+    assert hass.states.get(ECO_MODE).state == STATE_OFF
+
+    # ...so a later change made elsewhere shows straight away.
     await update_charge_point(hass, setup_integration, mock_client)
+    assert hass.states.get(ECO_MODE).state == STATE_ON
+
+
+async def test_a_command_that_never_sticks_gives_way(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_client: AsyncMock,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    await _switch(hass, SERVICE_TURN_OFF, ECO_MODE)
+
+    freezer.tick(OPTIMISTIC_TIMEOUT + timedelta(seconds=1))
+    await update_charge_point(hass, setup_integration, mock_client)
+
     assert hass.states.get(ECO_MODE).state == STATE_ON
 
 
@@ -158,13 +203,23 @@ async def test_failed_command_is_reported_and_not_assumed(
 ) -> None:
     mock_client.async_set_eco_mode.side_effect = OctopusChargeServerError("down")
 
-    with pytest.raises(OctopusChargeServerError):
+    with pytest.raises(HomeAssistantError):
         await _switch(hass, SERVICE_TURN_OFF, ECO_MODE)
 
     assert hass.states.get(ECO_MODE).state == STATE_ON
 
 
-# --- boost ------------------------------------------------------------------
+async def test_rejected_api_key_on_a_command_starts_reauth(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client: AsyncMock
+) -> None:
+    mock_client.async_set_eco_mode.side_effect = OctopusChargeAuthError("no")
+
+    with pytest.raises(HomeAssistantError):
+        await _switch(hass, SERVICE_TURN_OFF, ECO_MODE)
+    await hass.async_block_till_done()
+
+    flows = hass.config_entries.flow.async_progress()
+    assert [flow["context"]["source"] for flow in flows] == ["reauth"]
 
 
 async def test_boost_state_follows_operational_state(
@@ -237,11 +292,56 @@ async def test_boost_charge_point_service(
 async def test_boost_charge_point_service_validates_input(
     hass: HomeAssistant, setup_integration: None, mock_client: AsyncMock
 ) -> None:
-    with pytest.raises(vol.Invalid):
+    for hours, minutes in ((-1, 0), (13, 0), (0, 60)):
+        with pytest.raises(vol.Invalid):
+            await hass.services.async_call(
+                DOMAIN,
+                "boost_charge_point",
+                {ATTR_ENTITY_ID: BOOST, "hours": hours, "minutes": minutes},
+                blocking=True,
+            )
+
+    with pytest.raises(ServiceValidationError):
         await hass.services.async_call(
             DOMAIN,
             "boost_charge_point",
-            {ATTR_ENTITY_ID: BOOST, "hours": -1, "minutes": 0},
+            {ATTR_ENTITY_ID: BOOST, "hours": 0, "minutes": 0},
+            blocking=True,
+        )
+
+    mock_client.async_start_boost.assert_not_awaited()
+
+
+async def test_boost_charge_point_service_for_the_device(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_client: AsyncMock,
+    device_registry: dr.DeviceRegistry,
+    burst: AsyncMock,
+) -> None:
+    """Targeting the charger boosts it, skipping its other switches."""
+    [device] = dr.async_entries_for_config_entry(
+        device_registry, setup_integration.entry_id
+    )
+
+    await hass.services.async_call(
+        DOMAIN,
+        "boost_charge_point",
+        {"device_id": device.id, "hours": 1, "minutes": 15},
+        blocking=True,
+    )
+
+    mock_client.async_start_boost.assert_awaited_once()
+
+
+async def test_boost_charge_point_service_on_another_switch(
+    hass: HomeAssistant, setup_integration: None, mock_client: AsyncMock
+) -> None:
+    with pytest.raises(ServiceNotSupported):
+        await hass.services.async_call(
+            DOMAIN,
+            "boost_charge_point",
+            {ATTR_ENTITY_ID: ECO_MODE, "hours": 1, "minutes": 0},
             blocking=True,
         )
 
@@ -307,4 +407,4 @@ async def test_led_brightness(
     mock_client.async_set_led_brightness.assert_awaited_once_with(
         ACCOUNT_NUMBER, DEVICE_UUID, 35
     )
-    assert hass.states.get(LED).state == "35.0"
+    assert hass.states.get(LED).state == "35"

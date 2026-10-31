@@ -10,7 +10,7 @@ from typing import Any
 import voluptuous as vol
 from homeassistant.components.switch import SwitchEntity, SwitchEntityDescription
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_validation as cv
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import entity_platform
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import dt as dt_util
@@ -28,6 +28,9 @@ from .entity import (
 PARALLEL_UPDATES = 1
 
 SERVICE_BOOST_CHARGE_POINT = "boost_charge_point"
+
+# Marks the switch that supports the boost_charge_point action.
+SUPPORT_BOOST_DURATION = 1
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -113,10 +116,14 @@ async def async_setup_entry(
     platform.async_register_entity_service(
         SERVICE_BOOST_CHARGE_POINT,
         {
-            vol.Required("hours"): cv.positive_int,
-            vol.Required("minutes"): cv.positive_int,
+            vol.Required("hours"): vol.All(vol.Coerce(int), vol.Range(min=0, max=12)),
+            vol.Required("minutes"): vol.All(vol.Coerce(int), vol.Range(min=0, max=59)),
         },
         "async_boost_charge_point",
+        # Only the Boost switch implements it: a device or area target skips the
+        # charger's other switches, and naming one of them directly is reported as
+        # not supported rather than failing with an AttributeError.
+        required_features=[SUPPORT_BOOST_DURATION],
     )
 
 
@@ -143,14 +150,16 @@ class OctopusChargeSettingSwitch(OctopusChargeEntity, SwitchEntity):
         fetched = (
             self.entity_description.value_fn(charge_point) if charge_point else None
         )
-        return self._optimistic.resolve(fetched, self.coordinator.last_retrieved)
+        return self._optimistic.resolve(fetched)
 
     async def _async_set(self, enabled: bool) -> None:
-        await self.entity_description.set_fn(
-            self.coordinator.client,
-            self.coordinator.account_number,
-            self._device_uuid,
-            enabled,
+        await self._async_send(
+            self.entity_description.set_fn(
+                self.coordinator.client,
+                self.coordinator.account_number,
+                self._device_uuid,
+                enabled,
+            )
         )
         self._optimistic.set(enabled)
         self.async_write_ha_state()
@@ -167,6 +176,8 @@ class OctopusChargeSettingSwitch(OctopusChargeEntity, SwitchEntity):
 class OctopusChargeBoostSwitch(OctopusChargeEntity, SwitchEntity):
     """Starts and stops a boost charge."""
 
+    _attr_supported_features = SUPPORT_BOOST_DURATION
+
     def __init__(self, coordinator: OctopusChargeCoordinator, device_uuid: str) -> None:
         """Initialise the switch."""
         super().__init__(coordinator, device_uuid, "boost")
@@ -181,13 +192,15 @@ class OctopusChargeBoostSwitch(OctopusChargeEntity, SwitchEntity):
             if charge_point is not None and charge_point.operationalState is not None
             else None
         )
-        return self._optimistic.resolve(fetched, self.coordinator.last_retrieved)
+        return self._optimistic.resolve(fetched)
 
     async def _async_start(self, duration: timedelta) -> None:
-        await self.coordinator.client.async_start_boost(
-            self.coordinator.account_number,
-            self._device_uuid,
-            dt_util.utcnow() + duration,
+        await self._async_send(
+            self.coordinator.client.async_start_boost(
+                self.coordinator.account_number,
+                self._device_uuid,
+                dt_util.utcnow() + duration,
+            )
         )
         self._optimistic.set(True)
         self.async_write_ha_state()
@@ -202,12 +215,17 @@ class OctopusChargeBoostSwitch(OctopusChargeEntity, SwitchEntity):
 
     async def async_boost_charge_point(self, hours: int, minutes: int) -> None:
         """Start a boost charge for a specific duration (boost_charge_point action)."""
-        await self._async_start(timedelta(hours=hours, minutes=minutes))
+        duration = timedelta(hours=hours, minutes=minutes)
+        if not duration:
+            raise ServiceValidationError("The boost duration must be more than zero")
+        await self._async_start(duration)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Stop the boost charge."""
-        await self.coordinator.client.async_stop_boost(
-            self.coordinator.account_number, self._device_uuid
+        await self._async_send(
+            self.coordinator.client.async_stop_boost(
+                self.coordinator.account_number, self._device_uuid
+            )
         )
         self._optimistic.set(False)
         self.async_write_ha_state()
