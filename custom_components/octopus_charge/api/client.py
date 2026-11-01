@@ -260,6 +260,18 @@ def _error_details(error: Any) -> dict[str, Any]:
     }
 
 
+def _validation_details(context: str, err: ValidationError) -> dict[str, Any]:
+    """Return which fields failed validation, and how: never their values."""
+    return {
+        "request": context,
+        "invalid": [
+            f"{'.'.join(str(part) for part in error['loc'])}: {error['type']}"
+            for error in err.errors(include_input=False, include_url=False)[:5]
+        ],
+        "invalid_count": err.error_count(),
+    }
+
+
 def _excerpt(text: str, limit: int = 200) -> str:
     """Return the start of a response body for an error message."""
     text = " ".join(text.split())
@@ -555,7 +567,9 @@ class OctopusChargeApiClient:
                 response_headers = response.headers
         except (TimeoutError, aiohttp.ClientError) as err:
             seconds = time.monotonic() - started
-            _LOGGER.warning(
+            # DEBUG: during an outage this happens on every poll, and the
+            # coordinator decides when an outage is worth a warning.
+            _LOGGER.debug(
                 "Failed to connect (%s) after %.1fs: %s",
                 context,
                 seconds,
@@ -616,18 +630,20 @@ class OctopusChargeApiClient:
         if status >= 400:
             self._raise_for_status(status, text, context, details())
 
+        # A successful response's body can hold account data or tokens, so only
+        # its length is recorded (the content type is among the headers).
         try:
             data = json.loads(text)
         except ValueError as err:
             raise OctopusChargeRequestError(
                 f"Failed to decode response ({context})",
-                details={**details(), "body": _excerpt(text)},
+                details={**details(), "body_length": len(text)},
             ) from err
 
         if not isinstance(data, dict):
             raise OctopusChargeRequestError(
                 f"Unexpected response ({context})",
-                details={**details(), "body": _excerpt(text)},
+                details={**details(), "body_length": len(text)},
             )
 
         errors = data.get("errors")
@@ -683,7 +699,8 @@ class OctopusChargeApiClient:
                 elif isinstance(err, OctopusChargeUnauthenticatedError):
                     self._token_rejected(token, untested=True)
                     raise OctopusChargeRequestError(
-                        f"Request rejected with a newly retrieved token ({context})"
+                        f"Request rejected with a newly retrieved token ({context})",
+                        details=err.details,
                     ) from err
                 else:
                     raise
@@ -728,7 +745,8 @@ class OctopusChargeApiClient:
             ]
         except ValidationError as err:
             raise OctopusChargeRequestError(
-                "Unexpected charge point data from Octopus"
+                "Unexpected charge point data from Octopus",
+                details=_validation_details("chargepoint-configuration", err),
             ) from err
 
     async def async_get_schedules(
@@ -752,7 +770,8 @@ class OctopusChargeApiClient:
             ]
         except ValidationError as err:
             raise OctopusChargeRequestError(
-                "Unexpected charge point schedule from Octopus"
+                "Unexpected charge point schedule from Octopus",
+                details=_validation_details("chargepoint-schedules", err),
             ) from err
 
     # ------------------------------------------------------------------
