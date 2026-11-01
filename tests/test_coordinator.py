@@ -28,6 +28,7 @@ from custom_components.octopus_charge.const import (
     BURST_DURATION_SECONDS,
     BURST_INTERVAL_SECONDS,
     DOMAIN,
+    OUTAGE_TOLERANCE,
     SCAN_INTERVAL,
     SCHEDULE_SCAN_INTERVAL,
 )
@@ -112,14 +113,44 @@ async def test_account_not_found_fails_setup(
     assert mock_config_entry.state is ConfigEntryState.SETUP_ERROR
 
 
-@pytest.mark.parametrize(
-    "error", [OctopusChargeServerError("x"), OctopusChargeConnectionError("x")]
-)
-async def test_failures_back_off_and_recovery_resets(
-    coordinator: OctopusChargeCoordinator, mock_client: AsyncMock, error: Exception
+ERRORS = [OctopusChargeServerError("x"), OctopusChargeConnectionError("x")]
+
+
+@pytest.mark.parametrize("error", ERRORS)
+async def test_short_outages_keep_the_last_data(
+    coordinator: OctopusChargeCoordinator,
+    mock_client: AsyncMock,
+    freezer: FrozenDateTimeFactory,
+    error: Exception,
 ) -> None:
+    retrieved = coordinator.last_retrieved
+    data = coordinator.data
     mock_client.async_get_charge_points.side_effect = error
 
+    # Failing polls inside the tolerance look like successes, at the normal rate.
+    for _ in range(14):
+        freezer.tick(timedelta(minutes=1))
+        await coordinator.async_refresh()
+        assert coordinator.last_update_success
+        assert coordinator.data is data
+        assert coordinator.last_exception is None
+
+    # But the data isn't any fresher than it was.
+    assert coordinator.last_retrieved == retrieved
+
+
+@pytest.mark.parametrize("error", ERRORS)
+async def test_long_outages_fail_and_back_off(
+    coordinator: OctopusChargeCoordinator,
+    mock_client: AsyncMock,
+    freezer: FrozenDateTimeFactory,
+    error: Exception,
+) -> None:
+    mock_client.async_get_charge_points.side_effect = error
+    await coordinator.async_refresh()
+    assert coordinator.last_update_success
+
+    freezer.tick(OUTAGE_TOLERANCE)
     await coordinator.async_refresh()
     assert not coordinator.last_update_success
     assert _retry_after(coordinator) == 120  # base 60s + 1 minute
@@ -127,24 +158,92 @@ async def test_failures_back_off_and_recovery_resets(
     await coordinator.async_refresh()
     assert _retry_after(coordinator) == 240  # base 60s + 3 minutes
 
+    # Recovery resets everything, so the next outage gets the tolerance again.
     mock_client.async_get_charge_points.side_effect = None
     mock_client.async_get_charge_points.return_value = [charge_point()]
     await coordinator.async_refresh()
     assert coordinator.last_update_success
 
     mock_client.async_get_charge_points.side_effect = error
+    freezer.tick(timedelta(minutes=1))
+    await coordinator.async_refresh()
+    assert coordinator.last_update_success
+    freezer.tick(OUTAGE_TOLERANCE)
     await coordinator.async_refresh()
     assert _retry_after(coordinator) == 120  # the count started again
 
 
-async def test_data_is_kept_while_failing(
-    coordinator: OctopusChargeCoordinator, mock_client: AsyncMock
+async def test_data_is_kept_after_the_tolerance_runs_out(
+    coordinator: OctopusChargeCoordinator,
+    mock_client: AsyncMock,
+    freezer: FrozenDateTimeFactory,
 ) -> None:
     mock_client.async_get_charge_points.side_effect = OctopusChargeServerError("x")
+    await coordinator.async_refresh()
+    freezer.tick(OUTAGE_TOLERANCE)
 
     await coordinator.async_refresh()
 
+    assert not coordinator.last_update_success
     assert list(coordinator.data) == [charge_point().deviceUUID]
+
+
+async def test_entities_stay_available_through_a_short_outage(
+    hass: HomeAssistant,
+    coordinator: OctopusChargeCoordinator,
+    mock_client: AsyncMock,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    states = {
+        state.entity_id: state.state
+        for state in hass.states.async_all()
+        if state.entity_id.endswith(("operational_state", "schedule", "connected"))
+    }
+    assert len(states) == 3
+    mock_client.async_get_charge_points.side_effect = OctopusChargeServerError("x")
+
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert {e: hass.states.get(e).state for e in states} == states
+
+    # The first failure is reported once; later ones in the same outage aren't.
+    freezer.tick(OUTAGE_TOLERANCE)
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert {hass.states.get(e).state for e in states} == {"unavailable"}
+
+
+async def test_the_outage_is_logged_once_and_the_recovery_noted(
+    coordinator: OctopusChargeCoordinator,
+    mock_client: AsyncMock,
+    freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("DEBUG", "custom_components.octopus_charge.coordinator")
+    mock_client.async_get_charge_points.side_effect = OctopusChargeServerError("x")
+    for _ in range(3):
+        await coordinator.async_refresh()
+        freezer.tick(timedelta(minutes=1))
+
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+
+    mock_client.async_get_charge_points.side_effect = None
+    mock_client.async_get_charge_points.return_value = [charge_point()]
+    await coordinator.async_refresh()
+    assert "retrieved again after 0:03:00" in caplog.text
+
+
+async def test_setup_fails_during_an_outage(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry, mock_client: AsyncMock
+) -> None:
+    # Nothing to fall back on, so the tolerance doesn't apply.
+    mock_client.async_get_charge_points.side_effect = OctopusChargeServerError("x")
+    mock_config_entry.add_to_hass(hass)
+
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+
+    assert mock_config_entry.state is ConfigEntryState.SETUP_RETRY
 
 
 async def test_rejected_api_key_starts_reauth(

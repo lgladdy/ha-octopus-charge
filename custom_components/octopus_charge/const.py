@@ -35,6 +35,11 @@ SCHEDULE_BURST_JITTER_MAX_SECONDS = 20
 # Never wait longer than this between attempts after repeated failures.
 MAX_RETRY_SECONDS = 30 * 60
 
+# Octopus's API regularly fails for a few minutes at a time. For this long after
+# the first failed status poll, entities keep the last known data (and polling
+# carries on at the normal rate) instead of going unavailable.
+OUTAGE_TOLERANCE = timedelta(minutes=15)
+
 DEFAULT_BOOST_DURATION = timedelta(hours=1)
 
 # How long a value just sent to the charger is shown while polls still return

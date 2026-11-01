@@ -15,3 +15,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Setup can reuse the API key of an existing Octopus Energy integration account.
 - Re-authentication flow when the API key is rejected.
 - Diagnostics with account and device identifiers redacted.
+
+### Changed
+
+- Entities keep their last known values for up to 15 minutes when Octopus's API
+  is failing (it often returns "Internal server error" for a few minutes at a
+  time), instead of going unavailable on the first failed poll. Polling carries
+  on at the normal rate meanwhile, so recovery is noticed within a minute.

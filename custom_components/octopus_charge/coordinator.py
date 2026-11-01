@@ -25,6 +25,7 @@ from .const import (
     BURST_INTERVAL_SECONDS,
     CONF_ACCOUNT_NUMBER,
     DOMAIN,
+    OUTAGE_TOLERANCE,
     SCAN_INTERVAL,
     SCHEDULE_BURST_JITTER_MAX_SECONDS,
     SCHEDULE_BURST_LEAD_SECONDS,
@@ -76,6 +77,8 @@ class OctopusChargeCoordinator(DataUpdateCoordinator[dict[str, OnboardedChargePo
 
         self._property_ids: list[str] | None = None
         self._consecutive_failures = 0
+        # When the current run of failed polls began, if there is one.
+        self._failing_since: datetime | None = None
         self._burst_task: asyncio.Task[None] | None = None
         self._burst_until: datetime | None = None
 
@@ -105,6 +108,28 @@ class OctopusChargeCoordinator(DataUpdateCoordinator[dict[str, OnboardedChargePo
         except OctopusChargeAuthError as err:
             raise ConfigEntryAuthFailed(str(err)) from err
         except OctopusChargeError as err:
+            if self._failing_since is None:
+                self._failing_since = started
+
+            # Short outages are common, so keep serving the last known data (at
+            # the normal poll rate, to notice the recovery quickly) rather than
+            # making every entity unavailable. last_retrieved is left alone: this
+            # data is no fresher than before.
+            if (
+                self.data is not None
+                and started - self._failing_since < OUTAGE_TOLERANCE
+            ):
+                _LOGGER.log(
+                    logging.WARNING
+                    if started == self._failing_since
+                    else logging.DEBUG,
+                    "Error retrieving charge point data, using the last known "
+                    "values for up to %s: %s",
+                    OUTAGE_TOLERANCE,
+                    err,
+                )
+                return self.data
+
             self._consecutive_failures += 1
             raise UpdateFailed(
                 f"Error retrieving charge point data: {err}",
@@ -113,6 +138,12 @@ class OctopusChargeCoordinator(DataUpdateCoordinator[dict[str, OnboardedChargePo
                 ),
             ) from err
 
+        if self._failing_since is not None:
+            _LOGGER.info(
+                "Charge point data retrieved again after %s",
+                started - self._failing_since,
+            )
+        self._failing_since = None
         self._consecutive_failures = 0
         self.last_retrieved = started
         return charge_points
@@ -148,9 +179,9 @@ class OctopusChargeCoordinator(DataUpdateCoordinator[dict[str, OnboardedChargePo
             # Octopus's side yet.
             await asyncio.sleep(BURST_INTERVAL_SECONDS)
 
-            # Already backed off after repeated failures - don't keep hammering
-            # a server that's failing; the normal retry schedule takes over.
-            if self._consecutive_failures > 0:
+            # Requests are failing - don't keep hammering a server that's
+            # struggling; the normal poll rate takes over.
+            if self._failing_since is not None:
                 break
 
             await self.async_refresh()

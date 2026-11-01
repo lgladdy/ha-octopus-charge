@@ -26,7 +26,7 @@ from custom_components.octopus_charge.api.models import (
     ChargePointDaySchedule,
     ChargePointPowerReading,
 )
-from custom_components.octopus_charge.const import DOMAIN
+from custom_components.octopus_charge.const import DOMAIN, OUTAGE_TOLERANCE
 
 from .conftest import DEVICE_UUID, charge_point, update_charge_point
 
@@ -540,13 +540,17 @@ async def test_live_power_keeps_streaming_through_a_failed_poll(
     freezer: FrozenDateTimeFactory,
 ) -> None:
     await _set_state(hass, setup_integration, mock_client, "CHARGING")
-    await _push(hass, stream, 7.2)
 
+    # An outage long enough for the status entities to give up.
     mock_client.async_get_charge_points.side_effect = OctopusChargeConnectionError
-    await setup_integration.runtime_data.coordinator.async_refresh()
+    coordinator = setup_integration.runtime_data.coordinator
+    await coordinator.async_refresh()
+    freezer.tick(OUTAGE_TOLERANCE)
+    await coordinator.async_refresh()
     await hass.async_block_till_done()
     assert hass.states.get(OPERATIONAL_STATE).state == STATE_UNAVAILABLE
 
+    await _push(hass, stream, 7.2)
     freezer.tick(timedelta(seconds=36))
     await _push(hass, stream, 7.0)
 
