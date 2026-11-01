@@ -6,8 +6,10 @@ import asyncio
 import base64
 import json
 import logging
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from typing import Any, NoReturn
 
 import aiohttp
@@ -193,6 +195,100 @@ def _quote(value: str) -> str:
 def _bool(value: bool) -> str:
     """Return a bool as a GraphQL boolean literal."""
     return "true" if value else "false"
+
+
+# The request context of token retrieval.
+TOKEN_CONTEXT = "refresh-token"
+
+# Response headers worth logging when a request fails: they identify the request
+# (so it can be quoted to Octopus) and say which layer answered it.
+DIAGNOSTIC_HEADERS = (
+    "x-request-id",
+    "x-amzn-requestid",
+    "x-amz-cf-id",
+    "x-amz-cf-pop",
+    "cf-ray",
+    "x-cache",
+    "via",
+    "server",
+    "retry-after",
+    "content-type",
+    "date",
+)
+
+
+def _response_details(
+    context: str, status: int, headers: Mapping[str, str], elapsed: float
+) -> dict[str, Any]:
+    """Return what to log about a response if the request turns out to have failed."""
+    return {
+        "request": context,
+        "status": status,
+        "seconds": round(elapsed, 2),
+        "headers": {
+            name: headers[name][:100] for name in DIAGNOSTIC_HEADERS if name in headers
+        },
+    }
+
+
+def _error_message(error: Any) -> str:
+    """Return a GraphQL error's message (errors aren't always objects)."""
+    if isinstance(error, dict):
+        return str(error.get("message", ""))
+    return str(error)
+
+
+def _error_code(error: Any) -> Any:
+    """Return a GraphQL error's ``extensions.errorCode``, if it has one."""
+    extensions = error.get("extensions") if isinstance(error, dict) else None
+    return extensions.get("errorCode") if isinstance(extensions, dict) else None
+
+
+def _error_details(error: Any) -> dict[str, Any]:
+    """Return the loggable parts of a GraphQL error: no values from the data."""
+    if not isinstance(error, dict):
+        return {"message": _excerpt(_error_message(error))}
+
+    extensions = error.get("extensions")
+    return {
+        "message": _excerpt(_error_message(error)),
+        "path": error.get("path"),
+        "extensions": {
+            str(key): _excerpt(str(value), 120)
+            for key, value in (
+                extensions if isinstance(extensions, dict) else {}
+            ).items()
+            if isinstance(value, str | int | float | bool)
+        },
+    }
+
+
+def _log_failed_response_body(context: str, status: int, text: str) -> None:
+    """Log the body of a failed request at DEBUG, to see what Octopus sent.
+
+    Never in ``details`` (they go into diagnostics and warnings), and never for
+    a successful token request, whose body is a credential.
+    """
+    if context == TOKEN_CONTEXT and status < 400:
+        return
+    _LOGGER.debug(
+        "Response body of failed request (%s, HTTP %s): %s",
+        context,
+        status,
+        _excerpt(text, 1000),
+    )
+
+
+def _validation_details(context: str, err: ValidationError) -> dict[str, Any]:
+    """Return which fields failed validation, and how: never their values."""
+    return {
+        "request": context,
+        "invalid": [
+            f"{'.'.join(str(part) for part in error['loc'])}: {error['type']}"
+            for error in err.errors(include_input=False, include_url=False)[:5]
+        ],
+        "invalid_count": err.error_count(),
+    }
 
 
 def _excerpt(text: str, limit: int = 200) -> str:
@@ -439,7 +535,7 @@ class OctopusChargeApiClient:
         body = await self._async_post(
             KRAKEN_GRAPHQL_URL,
             {"query": TOKEN_MUTATION.format(credential=credential)},
-            "refresh-token",
+            TOKEN_CONTEXT,
         )
         token = (body.get("data") or {}).get("obtainKrakenToken")
         try:
@@ -479,30 +575,50 @@ class OctopusChargeApiClient:
         if token is not None:
             headers["Authorization"] = token
 
+        started = time.monotonic()
         try:
             async with self._session.post(
                 url, json=payload, headers=headers, timeout=self._timeout
             ) as response:
                 text = await response.text()
+                elapsed = time.monotonic() - started
                 status = response.status
-        except aiohttp.ClientConnectorError as err:
-            _LOGGER.warning("Failed to connect (%s): %s", context, type(err).__name__)
-            raise OctopusChargeCannotConnectError(
-                f"Failed to connect ({context})"
-            ) from err
+                response_headers = response.headers
         except (TimeoutError, aiohttp.ClientError) as err:
-            _LOGGER.warning("Failed to connect (%s): %s", context, type(err).__name__)
+            seconds = time.monotonic() - started
+            # DEBUG: during an outage this happens on every poll, and the
+            # coordinator decides when an outage is worth a warning.
+            _LOGGER.debug(
+                "Failed to connect (%s) after %.1fs: %s",
+                context,
+                seconds,
+                type(err).__name__,
+            )
+            details = {
+                "request": context,
+                "seconds": round(seconds, 2),
+                "error": type(err).__name__,
+            }
+            if isinstance(err, aiohttp.ClientConnectorError):
+                raise OctopusChargeCannotConnectError(
+                    f"Failed to connect ({context})", details=details
+                ) from err
             raise OctopusChargeConnectionError(
-                f"Failed to connect ({context})"
+                f"Failed to connect ({context})", details=details
             ) from err
 
-        return self._process_response(status, text, context)
+        return self._process_response(status, text, context, response_headers, elapsed)
 
-    def _raise_for_status(self, status: int, text: str, context: str) -> NoReturn:
+    def _raise_for_status(
+        self, status: int, text: str, context: str, details: dict[str, Any]
+    ) -> NoReturn:
         """Raise the error for an HTTP error status (400 and above)."""
+        _log_failed_response_body(context, status, text)
+        details = {**details, "body_length": len(text)}
         if status >= 500 or status == 429:
             raise OctopusChargeServerError(
-                f"Octopus server error ({context}): {status}; {_excerpt(text)}"
+                f"Octopus server error ({context}): {status}; {_excerpt(text)}",
+                details=details,
             )
 
         if status in (401, 403):
@@ -510,44 +626,72 @@ class OctopusChargeApiClient:
             # them apart from an unauthenticated request.
             if status == 403 and "The request could not be satisfied" in text:
                 raise OctopusChargeServerError(
-                    f"Octopus server error ({context}): {status}"
+                    f"Octopus server error ({context}): {status}", details=details
                 )
 
             raise OctopusChargeUnauthenticatedError(
-                f"Unauthenticated request ({context}): {status}"
+                f"Unauthenticated request ({context}): {status}", details=details
             )
 
         raise OctopusChargeRequestError(
-            f"Request failed ({context}): {status}; {_excerpt(text)}"
+            f"Request failed ({context}): {status}; {_excerpt(text)}", details=details
         )
 
-    def _process_response(self, status: int, text: str, context: str) -> dict[str, Any]:
+    def _process_response(
+        self,
+        status: int,
+        text: str,
+        context: str,
+        headers: Mapping[str, str] | None = None,
+        elapsed: float = 0.0,
+    ) -> dict[str, Any]:
+        # Only built if the request turns out to have failed.
+        details = partial(_response_details, context, status, headers or {}, elapsed)
         if status >= 400:
-            self._raise_for_status(status, text, context)
+            self._raise_for_status(status, text, context, details())
 
+        # A successful response's body can hold account data or tokens, so the
+        # details only record its length (the content type is among the
+        # headers); the body itself is only logged at DEBUG.
         try:
             data = json.loads(text)
         except ValueError as err:
+            _log_failed_response_body(context, status, text)
             raise OctopusChargeRequestError(
-                f"Failed to decode response ({context})"
+                f"Failed to decode response ({context})",
+                details={**details(), "body_length": len(text)},
             ) from err
 
         if not isinstance(data, dict):
-            raise OctopusChargeRequestError(f"Unexpected response ({context})")
+            _log_failed_response_body(context, status, text)
+            raise OctopusChargeRequestError(
+                f"Unexpected response ({context})",
+                details={**details(), "body_length": len(text)},
+            )
 
         errors = data.get("errors")
         if errors:
-            messages = [str(error.get("message", "")).strip(".,!") for error in errors]
+            if not isinstance(errors, list):
+                errors = [errors]
+            messages = [_error_message(error).strip(".,!") for error in errors]
+            error_details = {
+                **details(),
+                "errors": [_error_details(error) for error in errors],
+                # Whether Octopus sent usable data alongside the errors.
+                "partial_data": bool(data.get("data")),
+            }
             for error in errors:
-                code = (error.get("extensions") or {}).get("errorCode")
-                if code in AUTH_ERROR_CODES:
+                if _error_code(error) in AUTH_ERROR_CODES:
                     raise OctopusChargeAuthError(
                         f"Authentication failed ({context}) - {', '.join(messages)}",
                         messages,
+                        error_details,
                     )
 
             raise OctopusChargeRequestError(
-                f"Request failed ({context}) - {', '.join(messages)}", messages
+                f"Request failed ({context}) - {', '.join(messages)}",
+                messages,
+                error_details,
             )
 
         return data
@@ -578,7 +722,8 @@ class OctopusChargeApiClient:
                 elif isinstance(err, OctopusChargeUnauthenticatedError):
                     self._token_rejected(token, untested=True)
                     raise OctopusChargeRequestError(
-                        f"Request rejected with a newly retrieved token ({context})"
+                        f"Request rejected with a newly retrieved token ({context})",
+                        details=err.details,
                     ) from err
                 else:
                     raise
@@ -623,7 +768,8 @@ class OctopusChargeApiClient:
             ]
         except ValidationError as err:
             raise OctopusChargeRequestError(
-                "Unexpected charge point data from Octopus"
+                "Unexpected charge point data from Octopus",
+                details=_validation_details("chargepoint-configuration", err),
             ) from err
 
     async def async_get_schedules(
@@ -647,7 +793,8 @@ class OctopusChargeApiClient:
             ]
         except ValidationError as err:
             raise OctopusChargeRequestError(
-                "Unexpected charge point schedule from Octopus"
+                "Unexpected charge point schedule from Octopus",
+                details=_validation_details("chargepoint-schedules", err),
             ) from err
 
     # ------------------------------------------------------------------
@@ -800,6 +947,7 @@ class OctopusChargeApiClient:
             **self._headers,
         }
 
+        started = time.monotonic()
         try:
             async with self._session.post(
                 BACKEND_GRAPHQL_URL,
@@ -810,7 +958,17 @@ class OctopusChargeApiClient:
                 if response.status >= 400:
                     text = await response.text()
                     try:
-                        self._raise_for_status(response.status, text, context)
+                        self._raise_for_status(
+                            response.status,
+                            text,
+                            context,
+                            _response_details(
+                                context,
+                                response.status,
+                                response.headers,
+                                time.monotonic() - started,
+                            ),
+                        )
                     except OctopusChargeUnauthenticatedError as err:
                         # Unlike other requests, a refused stream doesn't discard
                         # or replace the shared token: the status polls are still
@@ -819,7 +977,8 @@ class OctopusChargeApiClient:
                         # endpoint. If the token really is bad, the next poll
                         # replaces it and the next reconnect picks that up.
                         raise OctopusChargeRequestError(
-                            "Live power stream refused the token"
+                            "Live power stream refused the token",
+                            details=err.details,
                         ) from err
 
                 # A 200 can still carry nothing but (auth) error parts, so the
@@ -836,5 +995,10 @@ class OctopusChargeApiClient:
                         yield reading
         except (TimeoutError, aiohttp.ClientError) as err:
             raise OctopusChargeConnectionError(
-                "Connection lost while streaming charge point power"
+                "Connection lost while streaming charge point power",
+                details={
+                    "request": context,
+                    "seconds": round(time.monotonic() - started, 2),
+                    "error": type(err).__name__,
+                },
             ) from err

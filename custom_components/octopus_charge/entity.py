@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable, Iterable
 from datetime import datetime
 
@@ -17,6 +18,8 @@ from .api.exceptions import OctopusChargeAuthError, OctopusChargeError
 from .api.models import OnboardedChargePoint
 from .const import DEVICE_NAME, DOMAIN, MANUFACTURER, OPTIMISTIC_TIMEOUT
 from .coordinator import OctopusChargeConfigEntry, OctopusChargeCoordinator
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @callback
@@ -146,6 +149,9 @@ class OctopusChargeEntity(CoordinatorEntity[OctopusChargeCoordinator]):
                 "Octopus Energy rejected the API key - re-authenticate the integration"
             ) from err
         except OctopusChargeError as err:
+            # The UI only shows the message; the details (status, request ids,
+            # timing) are for the logs.
+            _LOGGER.warning("Command to the charger failed: %s", err.describe())
             raise HomeAssistantError(
                 f"Octopus Energy didn't accept the change: {err}"
             ) from err

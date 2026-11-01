@@ -38,6 +38,17 @@ Root: `hacs.json`, `.github/workflows/` (lint, tests, hassfest, HACS),
 - Live power is push driven (a long-lived multipart POST), only open while the
   charger is charging. The energy sensor integrates it and resolves the live
   power entity through the entity registry by unique id.
+- A failing status poll is tolerated for `OUTAGE_TOLERANCE` (15 minutes): the
+  coordinator returns its last data (polling at the normal rate, not backing
+  off) and only raises `UpdateFailed` once the outage outlasts that. Octopus's
+  API fails like this for a few minutes about once an hour.
+- API errors carry a `details` dict (status, timing, error paths/extensions,
+  request-id style headers). It is logged on the first failed poll of an outage
+  and kept in `coordinator.last_failure` for diagnostics. It must never hold
+  credentials or anything from the response `data` (serials, pins, etc.): add
+  headers by name to `DIAGNOSTIC_HEADERS`, never dump a whole response. The
+  body of a failed request is only logged at DEBUG (never put in `details`),
+  and never for a successful token response, whose body is a credential.
 - `strings.json` and `translations/en.json` must stay identical.
 - Entity unique ids are `{device_uuid}_{key}` and entity ids come from the device
   name + translated entity name, e.g. `sensor.octopus_charge_live_power`.

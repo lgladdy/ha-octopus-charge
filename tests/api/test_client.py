@@ -532,11 +532,23 @@ async def test_unexpected_charge_point_data_is_a_request_error(
 ) -> None:
     token_mock.post(
         BACKEND_GRAPHQL_URL,
-        json={"data": {"chargePointsAtLocation": {"chargePoints": [{"model": "x"}]}}},
+        json={
+            "data": {
+                "chargePointsAtLocation": {
+                    "chargePoints": [{"model": "SECRET", "deviceUUID": ["SECRET"]}]
+                }
+            }
+        },
     )
 
-    with pytest.raises(OctopusChargeRequestError):
+    with pytest.raises(OctopusChargeRequestError) as err:
         await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
+
+    # Which fields failed, but not their values.
+    assert err.value.details["request"] == "chargepoint-configuration"
+    assert err.value.details["invalid_count"] >= 1
+    assert err.value.details["invalid"] == ["deviceUUID: string_type"]
+    assert "SECRET" not in err.value.describe()
 
 
 async def test_graphql_errors_are_request_errors(
@@ -554,6 +566,145 @@ async def test_graphql_errors_are_request_errors(
     assert err.value.errors == ["Something odd"]
 
 
+async def test_graphql_errors_carry_diagnostic_details(
+    client: OctopusChargeApiClient, token_mock: AiohttpClientMocker
+) -> None:
+    token_mock.post(
+        BACKEND_GRAPHQL_URL,
+        json={
+            "data": {"chargePointConfiguration": {"serialNumber": "SECRET-SERIAL"}},
+            "errors": [
+                {
+                    "message": "Internal server error.",
+                    "path": ["chargePointConfiguration"],
+                    "extensions": {"errorClass": "INTERNAL", "nested": {"a": 1}},
+                }
+            ],
+        },
+        headers={
+            "x-request-id": "req-123",
+            "cf-ray": "ray-456",
+            "set-cookie": "session=SECRET-COOKIE",
+        },
+    )
+
+    with pytest.raises(OctopusChargeRequestError) as err:
+        await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
+
+    details = err.value.details
+    assert details["request"] == "chargepoint-configuration"
+    assert details["status"] == 200
+    assert details["partial_data"] is True
+    assert details["errors"] == [
+        {
+            "message": "Internal server error.",
+            "path": ["chargePointConfiguration"],
+            "extensions": {"errorClass": "INTERNAL"},
+        }
+    ]
+    assert details["headers"]["x-request-id"] == "req-123"
+    assert details["headers"]["cf-ray"] == "ray-456"
+
+    # Only the listed headers, and nothing from the response data.
+    logged = err.value.details_text()
+    assert "SECRET-COOKIE" not in logged
+    assert "SECRET-SERIAL" not in logged
+    assert "set-cookie" not in logged
+
+
+async def test_http_errors_carry_diagnostic_details(
+    client: OctopusChargeApiClient,
+    token_mock: AiohttpClientMocker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("DEBUG", "custom_components.octopus_charge.api.client")
+    token_mock.post(
+        BACKEND_GRAPHQL_URL,
+        status=502,
+        text="<html>Bad gateway</html>",
+        headers={"server": "cloudfront", "via": "1.1 abc.cloudfront.net"},
+    )
+
+    with pytest.raises(OctopusChargeServerError) as err:
+        await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
+
+    assert err.value.details["status"] == 502
+    assert err.value.details["body_length"] == len("<html>Bad gateway</html>")
+    # The body itself is only logged, at DEBUG.
+    assert "<html>Bad gateway</html>" in caplog.text
+    assert err.value.details["headers"]["server"] == "cloudfront"
+    assert "seconds" in err.value.details
+
+
+@pytest.mark.parametrize(
+    "body", ['{"data": {"token": "SECRET-TOKEN"', '["SECRET-TOKEN"]']
+)
+async def test_unreadable_successful_responses_leave_out_the_body(
+    client: OctopusChargeApiClient,
+    token_mock: AiohttpClientMocker,
+    caplog: pytest.LogCaptureFixture,
+    body: str,
+) -> None:
+    """A 200's body can hold account data, so it is only logged at DEBUG."""
+    caplog.set_level("DEBUG", "custom_components.octopus_charge.api.client")
+    token_mock.post(BACKEND_GRAPHQL_URL, text=body)
+
+    with pytest.raises(OctopusChargeRequestError) as err:
+        await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
+
+    assert err.value.details["status"] == 200
+    assert err.value.details["body_length"] == len(body)
+    assert "SECRET-TOKEN" not in err.value.describe()
+    debug = [r for r in caplog.records if "SECRET-TOKEN" in r.getMessage()]
+    assert [r.levelname for r in debug] == ["DEBUG"]
+
+
+async def test_unreadable_token_responses_are_never_logged(
+    client: OctopusChargeApiClient,
+    aioclient_mock: AiohttpClientMocker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A successful token response's body is a credential, even at DEBUG."""
+    caplog.set_level("DEBUG")
+    aioclient_mock.post(
+        KRAKEN_GRAPHQL_URL,
+        text='{"data": {"obtainKrakenToken": {"token": "SECRET-TOKEN"',
+    )
+
+    with pytest.raises(OctopusChargeRequestError):
+        await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
+
+    assert "SECRET-TOKEN" not in caplog.text
+
+
+async def test_refusal_of_a_new_token_keeps_the_details(
+    client: OctopusChargeApiClient, token_mock: AiohttpClientMocker
+) -> None:
+    token_mock.post(
+        BACKEND_GRAPHQL_URL, status=401, headers={"x-request-id": "req-123"}
+    )
+
+    with pytest.raises(OctopusChargeRequestError) as err:
+        await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
+
+    assert "newly retrieved token" in str(err.value)
+    assert err.value.details["status"] == 401
+    assert err.value.details["headers"]["x-request-id"] == "req-123"
+
+
+async def test_connection_errors_carry_details(
+    client: OctopusChargeApiClient, aioclient_mock: AiohttpClientMocker
+) -> None:
+    aioclient_mock.post(KRAKEN_GRAPHQL_URL, exc=TimeoutError())
+
+    with pytest.raises(OctopusChargeConnectionError) as err:
+        await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
+
+    assert err.value.details["error"] == "TimeoutError"
+    assert err.value.details["request"] == "refresh-token"
+    assert "seconds" in err.value.details
+
+
 async def test_graphql_auth_error_codes_are_auth_errors(
     client: OctopusChargeApiClient, token_mock: AiohttpClientMocker
 ) -> None:
@@ -566,6 +717,28 @@ async def test_graphql_auth_error_codes_are_auth_errors(
 
     with pytest.raises(OctopusChargeAuthError):
         await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
+
+
+@pytest.mark.parametrize(
+    "errors",
+    [
+        ["Internal server error."],
+        "Internal server error.",
+        [{"message": "Internal server error.", "extensions": "INTERNAL"}],
+    ],
+)
+async def test_malformed_graphql_errors_are_request_errors(
+    client: OctopusChargeApiClient, token_mock: AiohttpClientMocker, errors: Any
+) -> None:
+    """Errors that aren't objects (or lists of them) mustn't crash the parsing."""
+    token_mock.post(BACKEND_GRAPHQL_URL, json={"errors": errors})
+
+    with pytest.raises(OctopusChargeRequestError) as err:
+        await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
+
+    assert not isinstance(err.value, OctopusChargeAuthError)
+    assert err.value.errors == ["Internal server error"]
+    assert err.value.details["errors"][0]["message"] == "Internal server error."
 
 
 async def test_connection_errors(
@@ -813,3 +986,31 @@ async def test_stream_connection_errors(
     with pytest.raises(OctopusChargeConnectionError):
         async for _ in client.async_stream_power(ACCOUNT_NUMBER, DEVICE_UUID):
             pass
+
+
+async def test_stream_errors_carry_details(
+    client: OctopusChargeApiClient, aioclient_mock: AiohttpClientMocker
+) -> None:
+    aioclient_mock.post(KRAKEN_GRAPHQL_URL, json=token_response())
+    aioclient_mock.post(
+        BACKEND_GRAPHQL_URL, status=401, headers={"x-request-id": "req-123"}
+    )
+
+    with pytest.raises(OctopusChargeRequestError) as err:
+        async for _ in client.async_stream_power(ACCOUNT_NUMBER, DEVICE_UUID):
+            pass
+
+    assert err.value.details["request"] == "chargepoint-power-stream"
+    assert err.value.details["status"] == 401
+    assert err.value.details["headers"]["x-request-id"] == "req-123"
+
+    aioclient_mock.clear_requests()
+    aioclient_mock.post(KRAKEN_GRAPHQL_URL, json=token_response())
+    aioclient_mock.post(BACKEND_GRAPHQL_URL, exc=aiohttp.ClientConnectionError())
+
+    with pytest.raises(OctopusChargeConnectionError) as err:
+        async for _ in client.async_stream_power(ACCOUNT_NUMBER, DEVICE_UUID):
+            pass
+
+    assert err.value.details["error"] == "ClientConnectionError"
+    assert "seconds" in err.value.details

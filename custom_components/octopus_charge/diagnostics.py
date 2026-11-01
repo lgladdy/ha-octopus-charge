@@ -39,6 +39,7 @@ async def async_get_config_entry_diagnostics(
             "entry": entry.as_dict(),
             "last_update_success": coordinator.last_update_success,
             "last_retrieved": coordinator.last_retrieved,
+            "last_failure": coordinator.last_failure,
             "charge_points": [
                 charge_point.model_dump() for charge_point in coordinator.data.values()
             ],
