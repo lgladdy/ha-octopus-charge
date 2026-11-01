@@ -28,4 +28,5 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ids, which layer answered). The first failed poll of an outage logs it, the
   recovery notes how long it lasted, and the diagnostics include the last
   failure. Failed commands and live power stream drops log the same details.
-  Credentials and response data are never included.
+  Credentials and response data are never included; the body of a failed
+  response is only logged with debug logging enabled.

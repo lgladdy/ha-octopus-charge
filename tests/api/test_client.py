@@ -613,8 +613,11 @@ async def test_graphql_errors_carry_diagnostic_details(
 
 
 async def test_http_errors_carry_diagnostic_details(
-    client: OctopusChargeApiClient, token_mock: AiohttpClientMocker
+    client: OctopusChargeApiClient,
+    token_mock: AiohttpClientMocker,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level("DEBUG", "custom_components.octopus_charge.api.client")
     token_mock.post(
         BACKEND_GRAPHQL_URL,
         status=502,
@@ -626,7 +629,9 @@ async def test_http_errors_carry_diagnostic_details(
         await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
 
     assert err.value.details["status"] == 502
-    assert err.value.details["body"] == "<html>Bad gateway</html>"
+    assert err.value.details["body_length"] == len("<html>Bad gateway</html>")
+    # The body itself is only logged, at DEBUG.
+    assert "<html>Bad gateway</html>" in caplog.text
     assert err.value.details["headers"]["server"] == "cloudfront"
     assert "seconds" in err.value.details
 
@@ -635,9 +640,13 @@ async def test_http_errors_carry_diagnostic_details(
     "body", ['{"data": {"token": "SECRET-TOKEN"', '["SECRET-TOKEN"]']
 )
 async def test_unreadable_successful_responses_leave_out_the_body(
-    client: OctopusChargeApiClient, token_mock: AiohttpClientMocker, body: str
+    client: OctopusChargeApiClient,
+    token_mock: AiohttpClientMocker,
+    caplog: pytest.LogCaptureFixture,
+    body: str,
 ) -> None:
-    """A 200's body can hold tokens or account data, so it isn't recorded."""
+    """A 200's body can hold account data, so it is only logged at DEBUG."""
+    caplog.set_level("DEBUG", "custom_components.octopus_charge.api.client")
     token_mock.post(BACKEND_GRAPHQL_URL, text=body)
 
     with pytest.raises(OctopusChargeRequestError) as err:
@@ -646,6 +655,26 @@ async def test_unreadable_successful_responses_leave_out_the_body(
     assert err.value.details["status"] == 200
     assert err.value.details["body_length"] == len(body)
     assert "SECRET-TOKEN" not in err.value.describe()
+    debug = [r for r in caplog.records if "SECRET-TOKEN" in r.getMessage()]
+    assert [r.levelname for r in debug] == ["DEBUG"]
+
+
+async def test_unreadable_token_responses_are_never_logged(
+    client: OctopusChargeApiClient,
+    aioclient_mock: AiohttpClientMocker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A successful token response's body is a credential, even at DEBUG."""
+    caplog.set_level("DEBUG")
+    aioclient_mock.post(
+        KRAKEN_GRAPHQL_URL,
+        text='{"data": {"obtainKrakenToken": {"token": "SECRET-TOKEN"',
+    )
+
+    with pytest.raises(OctopusChargeRequestError):
+        await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
+
+    assert "SECRET-TOKEN" not in caplog.text
 
 
 async def test_refusal_of_a_new_token_keeps_the_details(

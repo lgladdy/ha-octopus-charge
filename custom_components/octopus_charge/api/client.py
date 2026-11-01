@@ -197,6 +197,9 @@ def _bool(value: bool) -> str:
     return "true" if value else "false"
 
 
+# The request context of token retrieval.
+TOKEN_CONTEXT = "refresh-token"
+
 # Response headers worth logging when a request fails: they identify the request
 # (so it can be quoted to Octopus) and say which layer answered it.
 DIAGNOSTIC_HEADERS = (
@@ -258,6 +261,22 @@ def _error_details(error: Any) -> dict[str, Any]:
             if isinstance(value, str | int | float | bool)
         },
     }
+
+
+def _log_failed_response_body(context: str, status: int, text: str) -> None:
+    """Log the body of a failed request at DEBUG, to see what Octopus sent.
+
+    Never in ``details`` (they go into diagnostics and warnings), and never for
+    a successful token request, whose body is a credential.
+    """
+    if context == TOKEN_CONTEXT and status < 400:
+        return
+    _LOGGER.debug(
+        "Response body of failed request (%s, HTTP %s): %s",
+        context,
+        status,
+        _excerpt(text, 1000),
+    )
 
 
 def _validation_details(context: str, err: ValidationError) -> dict[str, Any]:
@@ -516,7 +535,7 @@ class OctopusChargeApiClient:
         body = await self._async_post(
             KRAKEN_GRAPHQL_URL,
             {"query": TOKEN_MUTATION.format(credential=credential)},
-            "refresh-token",
+            TOKEN_CONTEXT,
         )
         token = (body.get("data") or {}).get("obtainKrakenToken")
         try:
@@ -594,7 +613,8 @@ class OctopusChargeApiClient:
         self, status: int, text: str, context: str, details: dict[str, Any]
     ) -> NoReturn:
         """Raise the error for an HTTP error status (400 and above)."""
-        details = {**details, "body": _excerpt(text)}
+        _log_failed_response_body(context, status, text)
+        details = {**details, "body_length": len(text)}
         if status >= 500 or status == 429:
             raise OctopusChargeServerError(
                 f"Octopus server error ({context}): {status}; {_excerpt(text)}",
@@ -630,17 +650,20 @@ class OctopusChargeApiClient:
         if status >= 400:
             self._raise_for_status(status, text, context, details())
 
-        # A successful response's body can hold account data or tokens, so only
-        # its length is recorded (the content type is among the headers).
+        # A successful response's body can hold account data or tokens, so the
+        # details only record its length (the content type is among the
+        # headers); the body itself is only logged at DEBUG.
         try:
             data = json.loads(text)
         except ValueError as err:
+            _log_failed_response_body(context, status, text)
             raise OctopusChargeRequestError(
                 f"Failed to decode response ({context})",
                 details={**details(), "body_length": len(text)},
             ) from err
 
         if not isinstance(data, dict):
+            _log_failed_response_body(context, status, text)
             raise OctopusChargeRequestError(
                 f"Unexpected response ({context})",
                 details={**details(), "body_length": len(text)},

@@ -46,7 +46,9 @@ Root: `hacs.json`, `.github/workflows/` (lint, tests, hassfest, HACS),
   request-id style headers). It is logged on the first failed poll of an outage
   and kept in `coordinator.last_failure` for diagnostics. It must never hold
   credentials or anything from the response `data` (serials, pins, etc.): add
-  headers by name to `DIAGNOSTIC_HEADERS`, never dump a whole response.
+  headers by name to `DIAGNOSTIC_HEADERS`, never dump a whole response. The
+  body of a failed request is only logged at DEBUG (never put in `details`),
+  and never for a successful token response, whose body is a credential.
 - `strings.json` and `translations/en.json` must stay identical.
 - Entity unique ids are `{device_uuid}_{key}` and entity ids come from the device
   name + translated entity name, e.g. `sensor.octopus_charge_live_power`.
