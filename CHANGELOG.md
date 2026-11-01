@@ -22,3 +22,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is failing (it often returns "Internal server error" for a few minutes at a
   time), instead of going unavailable on the first failed poll. Polling carries
   on at the normal rate meanwhile, so recovery is noticed within a minute.
+- Failed requests are now logged with more context: HTTP status, how long the
+  request took, the GraphQL error paths and extension fields, whether Octopus
+  sent data alongside the errors, and identifying response headers (request
+  ids, which layer answered). The first failed poll of an outage logs it, the
+  recovery notes how long it lasted, and the diagnostics include the last
+  failure. Credentials and response data are never included.

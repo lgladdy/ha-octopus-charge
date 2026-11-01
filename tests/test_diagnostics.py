@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import AsyncMock
 
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.octopus_charge.api.exceptions import OctopusChargeRequestError
 from custom_components.octopus_charge.diagnostics import (
     async_get_config_entry_diagnostics,
 )
@@ -43,3 +45,20 @@ async def test_diagnostics_include_the_useful_data(
     assert diagnostics["schedules"][0]["MONDAY"] == [
         {"start": "18:00", "end": "19:00", "action": "ON"}
     ]
+
+
+async def test_diagnostics_include_the_last_failure(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client: AsyncMock
+) -> None:
+    mock_client.async_get_charge_points.side_effect = OctopusChargeRequestError(
+        "Request failed - Internal server error",
+        details={"status": 200, "request": "chargepoint-configuration"},
+    )
+    await setup_integration.runtime_data.coordinator.async_refresh()
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, setup_integration)
+
+    assert diagnostics["last_failure"]["error"] == (
+        "Request failed - Internal server error"
+    )
+    assert diagnostics["last_failure"]["details"]["status"] == 200

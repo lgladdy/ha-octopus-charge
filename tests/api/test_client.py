@@ -554,6 +554,84 @@ async def test_graphql_errors_are_request_errors(
     assert err.value.errors == ["Something odd"]
 
 
+async def test_graphql_errors_carry_diagnostic_details(
+    client: OctopusChargeApiClient, token_mock: AiohttpClientMocker
+) -> None:
+    token_mock.post(
+        BACKEND_GRAPHQL_URL,
+        json={
+            "data": {"chargePointConfiguration": {"serialNumber": "SECRET-SERIAL"}},
+            "errors": [
+                {
+                    "message": "Internal server error.",
+                    "path": ["chargePointConfiguration"],
+                    "extensions": {"errorClass": "INTERNAL", "nested": {"a": 1}},
+                }
+            ],
+        },
+        headers={
+            "x-request-id": "req-123",
+            "cf-ray": "ray-456",
+            "set-cookie": "session=SECRET-COOKIE",
+        },
+    )
+
+    with pytest.raises(OctopusChargeRequestError) as err:
+        await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
+
+    details = err.value.details
+    assert details["request"] == "chargepoint-configuration"
+    assert details["status"] == 200
+    assert details["partial_data"] is True
+    assert details["errors"] == [
+        {
+            "message": "Internal server error.",
+            "path": ["chargePointConfiguration"],
+            "extensions": {"errorClass": "INTERNAL"},
+        }
+    ]
+    assert details["headers"]["x-request-id"] == "req-123"
+    assert details["headers"]["cf-ray"] == "ray-456"
+
+    # Only the listed headers, and nothing from the response data.
+    logged = err.value.details_text()
+    assert "SECRET-COOKIE" not in logged
+    assert "SECRET-SERIAL" not in logged
+    assert "set-cookie" not in logged
+
+
+async def test_http_errors_carry_diagnostic_details(
+    client: OctopusChargeApiClient, token_mock: AiohttpClientMocker
+) -> None:
+    token_mock.post(
+        BACKEND_GRAPHQL_URL,
+        status=502,
+        text="<html>Bad gateway</html>",
+        headers={"server": "cloudfront", "via": "1.1 abc.cloudfront.net"},
+    )
+
+    with pytest.raises(OctopusChargeServerError) as err:
+        await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
+
+    assert err.value.details["status"] == 502
+    assert err.value.details["body"] == "<html>Bad gateway</html>"
+    assert err.value.details["headers"]["server"] == "cloudfront"
+    assert "seconds" in err.value.details
+
+
+async def test_connection_errors_carry_details(
+    client: OctopusChargeApiClient, aioclient_mock: AiohttpClientMocker
+) -> None:
+    aioclient_mock.post(KRAKEN_GRAPHQL_URL, exc=TimeoutError())
+
+    with pytest.raises(OctopusChargeConnectionError) as err:
+        await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
+
+    assert err.value.details["error"] == "TimeoutError"
+    assert err.value.details["request"] == "refresh-token"
+    assert "seconds" in err.value.details
+
+
 async def test_graphql_auth_error_codes_are_auth_errors(
     client: OctopusChargeApiClient, token_mock: AiohttpClientMocker
 ) -> None:

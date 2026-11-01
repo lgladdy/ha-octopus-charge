@@ -22,6 +22,7 @@ from pytest_homeassistant_custom_component.common import (
 from custom_components.octopus_charge.api.exceptions import (
     OctopusChargeAuthError,
     OctopusChargeConnectionError,
+    OctopusChargeRequestError,
     OctopusChargeServerError,
 )
 from custom_components.octopus_charge.const import (
@@ -231,7 +232,32 @@ async def test_the_outage_is_logged_once_and_the_recovery_noted(
     mock_client.async_get_charge_points.side_effect = None
     mock_client.async_get_charge_points.return_value = [charge_point()]
     await coordinator.async_refresh()
-    assert "retrieved again after 0:03:00" in caplog.text
+    assert "retrieved again after 0:03:00 (3 failed polls)" in caplog.text
+
+
+async def test_failures_are_logged_with_their_details(
+    coordinator: OctopusChargeCoordinator,
+    mock_client: AsyncMock,
+    freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    error = OctopusChargeRequestError(
+        "Request failed (chargepoint-configuration) - Internal server error",
+        details={"status": 200, "headers": {"x-request-id": "req-123"}},
+    )
+    mock_client.async_get_charge_points.side_effect = error
+
+    await coordinator.async_refresh()
+
+    warning = next(r for r in caplog.records if r.levelname == "WARNING")
+    assert '"x-request-id":"req-123"' in warning.getMessage()
+    assert coordinator.last_failure is not None
+    assert coordinator.last_failure["details"] == error.details
+
+    # Once the tolerance runs out the same details are on the error itself.
+    freezer.tick(OUTAGE_TOLERANCE)
+    await coordinator.async_refresh()
+    assert '"x-request-id":"req-123"' in str(coordinator.last_exception)
 
 
 async def test_setup_fails_during_an_outage(
