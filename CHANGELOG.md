@@ -27,4 +27,5 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sent data alongside the errors, and identifying response headers (request
   ids, which layer answered). The first failed poll of an outage logs it, the
   recovery notes how long it lasted, and the diagnostics include the last
-  failure. Credentials and response data are never included.
+  failure. Failed commands and live power stream drops log the same details.
+  Credentials and response data are never included.

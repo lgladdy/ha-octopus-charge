@@ -269,6 +269,25 @@ async def test_failed_command_is_reported_and_not_assumed(
     assert hass.states.get(ECO_MODE).state == STATE_ON
 
 
+async def test_failed_command_logs_its_details(
+    hass: HomeAssistant,
+    setup_integration: None,
+    mock_client: AsyncMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    mock_client.async_set_eco_mode.side_effect = OctopusChargeServerError(
+        "down", details={"status": 502, "headers": {"x-request-id": "req-123"}}
+    )
+
+    with pytest.raises(HomeAssistantError) as err:
+        await _switch(hass, SERVICE_TURN_OFF, ECO_MODE)
+
+    # The details are for the log, not the message shown in the UI.
+    assert "req-123" not in str(err.value)
+    assert "Command to the charger failed: down [" in caplog.text
+    assert "req-123" in caplog.text
+
+
 async def test_rejected_api_key_on_a_command_starts_reauth(
     hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client: AsyncMock
 ) -> None:

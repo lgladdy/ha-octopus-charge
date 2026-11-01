@@ -120,7 +120,6 @@ class OctopusChargeCoordinator(DataUpdateCoordinator[dict[str, OnboardedChargePo
                 "error": str(err),
                 "details": err.details,
             }
-            detail = f" [{err.details_text()}]" if err.details else ""
 
             # Short outages are common, so keep serving the last known data (at
             # the normal poll rate, to notice the recovery quickly) rather than
@@ -135,16 +134,15 @@ class OctopusChargeCoordinator(DataUpdateCoordinator[dict[str, OnboardedChargePo
                     if started == self._failing_since
                     else logging.DEBUG,
                     "Error retrieving charge point data, using the last known "
-                    "values for up to %s: %s%s",
+                    "values for up to %s: %s",
                     OUTAGE_TOLERANCE,
-                    err,
-                    detail,
+                    err.describe(),
                 )
                 return self.data
 
             self._consecutive_failures += 1
             raise UpdateFailed(
-                f"Error retrieving charge point data: {err}{detail}",
+                f"Error retrieving charge point data: {err.describe()}",
                 retry_after=retry_after_seconds(
                     self._consecutive_failures, SCAN_INTERVAL.total_seconds()
                 ),
@@ -271,8 +269,7 @@ class OctopusChargeScheduleCoordinator(DataUpdateCoordinator[dict[str, ScheduleB
         except OctopusChargeError as err:
             self._consecutive_failures += 1
             raise UpdateFailed(
-                f"Error retrieving charge point schedule: {err}"
-                + (f" [{err.details_text()}]" if err.details else ""),
+                f"Error retrieving charge point schedule: {err.describe()}",
                 retry_after=retry_after_seconds(
                     self._consecutive_failures, SCHEDULE_SCAN_INTERVAL.total_seconds()
                 ),

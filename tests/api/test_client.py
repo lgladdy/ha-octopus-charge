@@ -646,6 +646,28 @@ async def test_graphql_auth_error_codes_are_auth_errors(
         await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
 
 
+@pytest.mark.parametrize(
+    "errors",
+    [
+        ["Internal server error."],
+        "Internal server error.",
+        [{"message": "Internal server error.", "extensions": "INTERNAL"}],
+    ],
+)
+async def test_malformed_graphql_errors_are_request_errors(
+    client: OctopusChargeApiClient, token_mock: AiohttpClientMocker, errors: Any
+) -> None:
+    """Errors that aren't objects (or lists of them) mustn't crash the parsing."""
+    token_mock.post(BACKEND_GRAPHQL_URL, json={"errors": errors})
+
+    with pytest.raises(OctopusChargeRequestError) as err:
+        await client.async_get_charge_points(ACCOUNT_NUMBER, PROPERTY_ID)
+
+    assert not isinstance(err.value, OctopusChargeAuthError)
+    assert err.value.errors == ["Internal server error"]
+    assert err.value.details["errors"][0]["message"] == "Internal server error."
+
+
 async def test_connection_errors(
     client: OctopusChargeApiClient, aioclient_mock: AiohttpClientMocker
 ) -> None:
@@ -891,3 +913,31 @@ async def test_stream_connection_errors(
     with pytest.raises(OctopusChargeConnectionError):
         async for _ in client.async_stream_power(ACCOUNT_NUMBER, DEVICE_UUID):
             pass
+
+
+async def test_stream_errors_carry_details(
+    client: OctopusChargeApiClient, aioclient_mock: AiohttpClientMocker
+) -> None:
+    aioclient_mock.post(KRAKEN_GRAPHQL_URL, json=token_response())
+    aioclient_mock.post(
+        BACKEND_GRAPHQL_URL, status=401, headers={"x-request-id": "req-123"}
+    )
+
+    with pytest.raises(OctopusChargeRequestError) as err:
+        async for _ in client.async_stream_power(ACCOUNT_NUMBER, DEVICE_UUID):
+            pass
+
+    assert err.value.details["request"] == "chargepoint-power-stream"
+    assert err.value.details["status"] == 401
+    assert err.value.details["headers"]["x-request-id"] == "req-123"
+
+    aioclient_mock.clear_requests()
+    aioclient_mock.post(KRAKEN_GRAPHQL_URL, json=token_response())
+    aioclient_mock.post(BACKEND_GRAPHQL_URL, exc=aiohttp.ClientConnectionError())
+
+    with pytest.raises(OctopusChargeConnectionError) as err:
+        async for _ in client.async_stream_power(ACCOUNT_NUMBER, DEVICE_UUID):
+            pass
+
+    assert err.value.details["error"] == "ClientConnectionError"
+    assert "seconds" in err.value.details

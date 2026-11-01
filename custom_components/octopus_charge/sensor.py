@@ -288,7 +288,7 @@ class OctopusChargePowerMonitor:
                 _LOGGER.debug(
                     "Live power stream for %s dropped: %s. Reconnecting in %ss",
                     self._device_uuid,
-                    err,
+                    err.describe(),
                     delay,
                 )
             except Exception:

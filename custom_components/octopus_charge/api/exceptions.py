@@ -24,6 +24,11 @@ class OctopusChargeError(Exception):
             return ""
         return json.dumps(self.details, default=str, separators=(",", ":"))
 
+    def describe(self) -> str:
+        """Return the message followed by the details, for the logs."""
+        details = self.details_text()
+        return f"{self} [{details}]" if details else str(self)
+
 
 class OctopusChargeServerError(OctopusChargeError):
     """Octopus returned a server-side (5xx / rate limit) error. Usually transient."""
