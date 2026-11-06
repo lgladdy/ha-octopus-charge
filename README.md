@@ -15,11 +15,21 @@ It runs **alongside** the [Octopus Energy integration](https://github.com/Bottle
 
 ## Installation
 
-### HACS (custom repository)
+### Marketplace / HACS (recommended)
 
-1. In HACS, open the three dots menu and choose **Custom repositories**
-2. Add `https://github.com/lgladdy/ha-octopus-charge` with type **Integration**
-3. Find **Octopus Charge**, click **Download** and restart Home Assistant
+[![Open your Home Assistant instance and open this repository in HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=lgladdy&repository=ha-octopus-charge&category=integration)
+
+Or, by hand, search for **Octopus Charge**:
+
+- **Home Assistant 2026.11 or later:** open **Settings** → **Marketplace**, search for *Octopus Charge* and select **Install**.
+- **Home Assistant 2026.9 and 2026.10, with HACS:** open **HACS**, search for *Octopus Charge*, click **Download** and restart Home Assistant.
+
+#### Fallback: add as a custom repository
+
+If it doesn't show up in the search (for example while it is still waiting to be added to the default catalog), add the repository yourself:
+
+- **Marketplace (2026.11 or later):** choose **Add from link** and enter `https://github.com/lgladdy/ha-octopus-charge`.
+- **HACS:** open the three dots menu, choose **Custom repositories**, add `https://github.com/lgladdy/ha-octopus-charge` with type **Integration**, then find **Octopus Charge** and click **Download**. Restart Home Assistant.
 
 ### Manual
 
