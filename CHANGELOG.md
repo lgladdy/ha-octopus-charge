@@ -30,3 +30,5 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   failure. Failed commands and live power stream drops log the same details.
   Credentials and response data are never included; the body of a failed
   response is only logged with debug logging enabled.
+- The schedule poll rides out short outages the same way, so a brief timeout no
+  longer logs an error or delays the next attempt.
