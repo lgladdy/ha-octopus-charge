@@ -2,8 +2,6 @@
 
 A Home Assistant custom integration for the [Octopus Charge](https://octopus.energy/octopus-charge/) home EV charger. It monitors and controls your charger straight from Home Assistant: live power, a cumulative energy total for the Energy dashboard, boost charging, the charging schedule and the charger's settings.
 
-> **Status:** early development. Install from `main` for now; there are no tagged releases yet.
-
 It runs **alongside** the [Octopus Energy integration](https://github.com/BottlecapDave/HomeAssistant-OctopusEnergy) rather than replacing it: keep using that for rates, consumption, Intelligent Octopus Go and so on.
 
 ## Features
@@ -21,7 +19,7 @@ It runs **alongside** the [Octopus Energy integration](https://github.com/Bottle
 
 1. In HACS, open the three dots menu and choose **Custom repositories**
 2. Add `https://github.com/lgladdy/ha-octopus-charge` with type **Integration**
-3. Find **Octopus Charge**, click **Download** (choose the `main` branch while there are no releases) and restart Home Assistant
+3. Find **Octopus Charge**, click **Download** and restart Home Assistant
 
 ### Manual
 
