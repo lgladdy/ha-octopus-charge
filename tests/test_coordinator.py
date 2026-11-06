@@ -38,7 +38,7 @@ from custom_components.octopus_charge.coordinator import (
     OctopusChargeScheduleCoordinator,
 )
 
-from .conftest import DEVICE_UUID, PROPERTY_ID, charge_point
+from .conftest import DEVICE_UUID, PROPERTY_ID, charge_point, schedules
 
 REAL_SLEEP = asyncio.sleep
 
@@ -407,16 +407,53 @@ async def test_schedule_is_keyed_by_device_and_day(
     assert schedule["TUESDAY"] == []
 
 
-async def test_schedule_failures_keep_the_previous_schedule(
-    schedule_coordinator: OctopusChargeScheduleCoordinator, mock_client: AsyncMock
+async def test_short_schedule_outages_are_tolerated(
+    schedule_coordinator: OctopusChargeScheduleCoordinator,
+    mock_client: AsyncMock,
+    freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     previous = schedule_coordinator.data
     mock_client.async_get_schedules.side_effect = OctopusChargeServerError("x")
 
+    for _ in range(2):
+        await schedule_coordinator.async_refresh()
+        freezer.tick(timedelta(minutes=10))
+
+    # No error, no backoff: just the last schedule, with one warning.
+    assert schedule_coordinator.last_update_success
+    assert schedule_coordinator.data is previous
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelname == "WARNING" and "schedule" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+
+    mock_client.async_get_schedules.side_effect = None
+    mock_client.async_get_schedules.return_value = schedules()
+    await schedule_coordinator.async_refresh()
+    assert (
+        "Charge point schedule retrieved again after 0:20:00 (2 failed polls)"
+        in caplog.text
+    )
+
+
+async def test_long_schedule_outages_fail_but_keep_the_previous_schedule(
+    schedule_coordinator: OctopusChargeScheduleCoordinator,
+    mock_client: AsyncMock,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    previous = schedule_coordinator.data
+    mock_client.async_get_schedules.side_effect = OctopusChargeServerError("x")
+    await schedule_coordinator.async_refresh()
+
+    freezer.tick(OUTAGE_TOLERANCE)
     await schedule_coordinator.async_refresh()
 
     assert not schedule_coordinator.last_update_success
     assert schedule_coordinator.data == previous
+    assert getattr(schedule_coordinator.last_exception, "retry_after", None) == 660
 
 
 async def test_setup_survives_a_schedule_failure(
