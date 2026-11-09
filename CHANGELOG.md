@@ -6,6 +6,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- The `pydantic` requirement now has a floor (`>=2`), since the models use the
+  pydantic 2 API (suggested in the HACS default list review).
+
 ## [1.0.1] - 2026-11-09
 
 ### Removed
