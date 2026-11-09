@@ -127,18 +127,24 @@ async def test_second_property_with_a_charger_is_enough(
     assert result["type"] is FlowResultType.CREATE_ENTRY
 
 
+@pytest.mark.parametrize("account_number", [ACCOUNT_NUMBER, " a-12345678 "])
 async def test_account_can_only_be_added_once(
-    hass: HomeAssistant, mock_config_entry: MockConfigEntry, mock_client: AsyncMock
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_client: AsyncMock,
+    account_number: str,
 ) -> None:
     mock_config_entry.add_to_hass(hass)
 
     result = await _start(hass)
     result = await _submit(
-        hass, result["flow_id"], api_key=API_KEY, account_number=ACCOUNT_NUMBER
+        hass, result["flow_id"], api_key=API_KEY, account_number=account_number
     )
 
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "already_configured"
+    # The duplicate is caught before Octopus is asked anything.
+    mock_client.async_get_property_ids.assert_not_awaited()
 
 
 async def test_reauth(
