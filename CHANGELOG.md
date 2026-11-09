@@ -6,6 +6,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-11-09
+
+### Removed
+
+- Setup no longer offers to copy the API key from an Octopus Energy integration
+  account. One integration shouldn't read another's stored credentials, so you
+  enter your own API key and account number (the same key works for both).
+
 ## [1.0.0] - 2026-11-06
 
 ### Added
