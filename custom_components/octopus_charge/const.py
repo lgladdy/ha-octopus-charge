@@ -54,7 +54,10 @@ OPERATIONAL_STATES = [
     "ONBOARDING",
     "SMART_CONTROL_SCHEDULED",
 ]
-CHARGING_STATES = ("CHARGING", "BOOST_CHARGING")
+# A smart charge holds the operational state at SMART_CONTROL_SCHEDULED for the
+# whole Intelligent slot instead of switching to CHARGING, so live power has to
+# stream there too.
+CHARGING_STATES = ("CHARGING", "BOOST_CHARGING", "SMART_CONTROL_SCHEDULED")
 BOOSTING_STATES = ("BOOST_CHARGING",)
 
 CHARGING_METHODS = ["SCHEDULED", "ON_DEMAND"]
