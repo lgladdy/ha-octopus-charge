@@ -257,6 +257,27 @@ async def test_live_power_streams_only_while_charging(
     assert hass.states.get(LIVE_POWER).state == "0"
 
 
+async def test_live_power_streams_during_a_smart_charge(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_client: AsyncMock,
+    stream: FakeStream,
+) -> None:
+    """A scheduled smart charge stays SMART_CONTROL_SCHEDULED while it runs."""
+    await update_charge_point(
+        hass,
+        setup_integration,
+        mock_client,
+        operationalState="SMART_CONTROL_SCHEDULED",
+    )
+    stream.push(7.4)
+    await _yield()
+    await hass.async_block_till_done()
+
+    assert stream.connections == 1
+    assert hass.states.get(LIVE_POWER).state == "7.4"
+
+
 async def test_live_power_streams_straight_away_if_already_charging(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
